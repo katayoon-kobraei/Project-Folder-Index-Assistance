@@ -70,5 +70,19 @@ If this repo is pushed to GitHub, it should be a **private** repository.
 
 ## Status
 
-Early scaffold — crawler not yet implemented. See `docs/` for the full
-architecture plan.
+Crawler is implemented and tested (`src/crawler/crawl.py`, `src/db/db.py`).
+Run it with:
+
+```
+python scripts\run_crawl.py
+```
+
+It walks every `TRABAJOS <year>` folder, parses `YY-NNN NAME` job codes and
+`YY-NNN-SS NAME` site codes, flags nested-revision folders (a later year's
+update sitting inside an older job/site folder), and writes everything into
+the SQLite database at `data/index.db` (path set in `config.yaml`) with a
+full-text search index ready to query.
+
+Still to build: entity resolution across years (`src/resolution/`), the
+search API and web UI (`src/search/`, `src/webapp/`). See `docs/` for the
+full architecture plan.
