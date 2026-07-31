@@ -1,0 +1,23 @@
+# Company data — never commit
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+config/config.yaml
+*.csv
+*.xlsx
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
