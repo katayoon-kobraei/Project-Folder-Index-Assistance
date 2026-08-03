@@ -42,7 +42,22 @@ CREATE TABLE IF NOT EXISTS project_links (
     folder_id   INTEGER NOT NULL REFERENCES folders(id),
     confidence  REAL,                       -- match score from resolution step
     confirmed   INTEGER DEFAULT 0,          -- 1 once a human has confirmed the link
+    phase       TEXT,                       -- e.g. 'direccion_obra' for a "DO ..." folder; NULL for the main phase
     PRIMARY KEY (project_id, folder_id)
+);
+
+-- A detected location (town/municipality) that recurs across multiple
+-- otherwise-unrelated projects. Built by src/resolution/detect_locations.py.
+CREATE TABLE IF NOT EXISTS locations (
+    id    INTEGER PRIMARY KEY,
+    name  TEXT UNIQUE NOT NULL          -- e.g. "SAGUNTO", "TORRENT"
+);
+
+-- Links a project to a location detected in its name.
+CREATE TABLE IF NOT EXISTS location_links (
+    location_id  INTEGER NOT NULL REFERENCES locations(id),
+    project_id   INTEGER NOT NULL REFERENCES projects(id),
+    PRIMARY KEY (location_id, project_id)
 );
 
 -- Full-text search index over folder names for instant lookup.
