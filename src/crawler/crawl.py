@@ -10,6 +10,7 @@ Folder depth convention (matches src/db/schema.sql):
          hold a later year's update inside an older job/site folder.
 """
 
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -19,9 +20,31 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.db.db import upsert_folder, rebuild_fts
 
-JOB_CODE_RE = re.compile(r"^(\d{2}-\d{3})\s+(.*)$")
-SITE_CODE_RE = re.compile(r"^(\d{2}-\d{3}-\d{2})\s+(.*)$")
+# Job code: YY-N to YY-NNNN, followed by at least one separator (space,
+# dash, or dot — e.g. "22-007 NAME", "14-001.- NAME", "14-023-NAME",
+# "09-44 NAME"). Real folder names in the archive use all of these.
+JOB_CODE_RE = re.compile(r"^(\d{2}-\d{2,4})[.\-\s]+(.+)$")
+SITE_CODE_RE = re.compile(r"^(\d{2}-\d{2,4}-\d{1,2})[.\-\s]+(.+)$")
 YEAR_IN_NAME_RE = re.compile(r"\b(20\d{2})\b")
+
+# Windows' legacy MAX_PATH limit (260 chars) breaks on deeply nested
+# archives (CAD model libraries, revision-inside-revision folders). The
+# \\?\ prefix tells the Win32 API to bypass that limit. No-op on non-Windows.
+WIN_LONG_PATH_PREFIX = "\\\\?\\"
+
+
+def _to_long_path(path: str) -> str:
+    if os.name != "nt":
+        return path
+    if path.startswith(WIN_LONG_PATH_PREFIX):
+        return path
+    return WIN_LONG_PATH_PREFIX + os.path.abspath(path)
+
+
+def _strip_long_path_prefix(path: str) -> str:
+    if path.startswith(WIN_LONG_PATH_PREFIX):
+        return path[len(WIN_LONG_PATH_PREFIX):]
+    return path
 
 
 def parse_job_folder(name: str):
@@ -30,10 +53,25 @@ def parse_job_folder(name: str):
     return m.groups() if m else None
 
 
-def parse_site_folder(name: str):
-    """Return (site_code, site_name) if `name` matches 'YY-NNN-SS NAME', else None."""
+def parse_site_folder(name: str, job_code: str | None = None):
+    """
+    Return (site_code, site_name) if `name` matches 'YY-NNN-SS NAME', else None.
+
+    If `job_code` is given, the site code's job-prefix (everything before
+    the last "-SS" segment) must exactly match it. Without this check, dated
+    filenames like "16-01-29 (ver) 15039 caravanas puzol" or
+    "27-10-15 MJESUS DOÑATE..." — which are just day-month-year dates, not
+    site codes — get misread as sites belonging to an unrelated job.
+    """
     m = SITE_CODE_RE.match(name)
-    return m.groups() if m else None
+    if not m:
+        return None
+    site_code, site_name = m.groups()
+    if job_code is not None:
+        job_prefix = site_code.rsplit("-", 1)[0]
+        if job_prefix != job_code:
+            return None
+    return site_code, site_name
 
 
 def has_year_mismatch(name: str, folder_year: int) -> bool:
@@ -48,11 +86,12 @@ def has_year_mismatch(name: str, folder_year: int) -> bool:
     return any(int(y) != folder_year for y in years_found)
 
 
-def _scan_dirs(path: Path, ignore_names: set):
+def _scan_dirs(path, ignore_names: set):
     """Yield subdirectories of `path`, skipping ignored names and anything
-    that errors out (permission issues on network drives are common)."""
+    that errors out (permission issues, or — on Windows — paths that
+    still exceed even the long-path limit)."""
     try:
-        with __import__("os").scandir(path) as it:
+        with os.scandir(path) as it:
             for entry in it:
                 if entry.name in ignore_names:
                     continue
@@ -60,14 +99,12 @@ def _scan_dirs(path: Path, ignore_names: set):
                     if entry.is_dir(follow_symlinks=False):
                         yield entry
                 except OSError as e:
-                    print(f"  [skip] {entry.path}: {e}")
+                    print(f"  [skip] {_strip_long_path_prefix(entry.path)}: {e}")
     except (PermissionError, OSError) as e:
-        print(f"  [skip] {path}: {e}")
+        print(f"  [skip] {_strip_long_path_prefix(str(path))}: {e}")
 
 
-def _file_count(path: Path) -> int:
-    import os
-
+def _file_count(path) -> int:
     try:
         with os.scandir(path) as it:
             return sum(1 for e in it if e.is_file(follow_symlinks=False))
@@ -82,7 +119,7 @@ def _row_from_entry(entry, depth, year, job_code, job_name, site_code, site_name
     except OSError:
         modified_at = None
     return {
-        "path": entry.path,
+        "path": _strip_long_path_prefix(entry.path),
         "depth": depth,
         "name": entry.name,
         "year": year,
@@ -99,7 +136,7 @@ def _row_from_entry(entry, depth, year, job_code, job_name, site_code, site_name
 def _walk_children(conn, parent_path, parent_depth, year, job_code, job_name,
                     site_code, site_name, ignore_names, stats):
     this_depth = parent_depth + 1
-    for entry in _scan_dirs(Path(parent_path), ignore_names):
+    for entry in _scan_dirs(parent_path, ignore_names):
         new_job_code, new_job_name = job_code, job_name
         new_site_code, new_site_name = site_code, site_name
 
@@ -108,7 +145,7 @@ def _walk_children(conn, parent_path, parent_depth, year, job_code, job_name,
             if parsed:
                 new_job_code, new_job_name = parsed
         elif this_depth == 2 and job_code is not None and site_code is None:
-            parsed = parse_site_folder(entry.name)
+            parsed = parse_site_folder(entry.name, job_code=job_code)
             if parsed:
                 new_site_code, new_site_name = parsed
 
@@ -121,6 +158,8 @@ def _walk_children(conn, parent_path, parent_depth, year, job_code, job_name,
         if stats["folders"] % 500 == 0:
             print(f"  ...{stats['folders']} folders indexed")
 
+        # entry.path already carries the \\?\ prefix if the parent scan did,
+        # so long-path support propagates automatically down the recursion.
         _walk_children(conn, entry.path, this_depth, year, new_job_code, new_job_name,
                         new_site_code, new_site_name, ignore_names, stats)
 
@@ -133,7 +172,7 @@ def crawl(conn, root_path: str, config: dict) -> dict:
     """
     ignore_names = set(config.get("ignore_names", []))
     year_pattern = re.compile(config["year_folder_pattern"])
-    root = Path(root_path)
+    root = _to_long_path(root_path)
 
     stats = {"years": 0, "folders": 0, "revision_hints": 0}
 
