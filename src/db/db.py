@@ -15,18 +15,20 @@ def open_db(db_path: str) -> sqlite3.Connection:
     return conn
 
 
-def upsert_folder(conn: sqlite3.Connection, row: dict) -> None:
+def upsert_folder(conn: sqlite3.Connection, row: dict) -> int:
     """Insert a folder row, or overwrite it if that path is already indexed
-    (path is UNIQUE — this is what makes rescans idempotent)."""
+    (path is UNIQUE — this is what makes rescans idempotent). Returns the
+    folder's id, so callers can attach files to it."""
     conn.execute(
         """
         INSERT INTO folders
-            (path, depth, name, year, job_code, job_name, site_code, site_name,
+            (path, source, depth, name, year, job_code, job_name, site_code, site_name,
              modified_at, file_count, is_revision_hint)
         VALUES
-            (:path, :depth, :name, :year, :job_code, :job_name, :site_code, :site_name,
+            (:path, :source, :depth, :name, :year, :job_code, :job_name, :site_code, :site_name,
              :modified_at, :file_count, :is_revision_hint)
         ON CONFLICT(path) DO UPDATE SET
+            source=excluded.source,
             depth=excluded.depth,
             name=excluded.name,
             year=excluded.year,
@@ -40,12 +42,33 @@ def upsert_folder(conn: sqlite3.Connection, row: dict) -> None:
         """,
         row,
     )
+    return conn.execute(
+        "SELECT id FROM folders WHERE path = ?", (row["path"],)
+    ).fetchone()[0]
+
+
+def upsert_file(conn: sqlite3.Connection, row: dict) -> None:
+    """Insert a file row, or overwrite it if that path is already indexed."""
+    conn.execute(
+        """
+        INSERT INTO files (path, folder_id, name, extension, modified_at, size_bytes)
+        VALUES (:path, :folder_id, :name, :extension, :modified_at, :size_bytes)
+        ON CONFLICT(path) DO UPDATE SET
+            folder_id=excluded.folder_id,
+            name=excluded.name,
+            extension=excluded.extension,
+            modified_at=excluded.modified_at,
+            size_bytes=excluded.size_bytes
+        """,
+        row,
+    )
 
 
 def rebuild_fts(conn: sqlite3.Connection) -> None:
-    """Repopulate the full-text index from the current contents of `folders`.
-    Uses FTS5's built-in 'rebuild' command, which is the safe way to
-    resync an external-content table (a manual DELETE + INSERT can corrupt
-    the shadow tables)."""
+    """Repopulate the full-text indexes from the current contents of
+    `folders` and `files`. Uses FTS5's built-in 'rebuild' command, which is
+    the safe way to resync an external-content table (a manual DELETE +
+    INSERT can corrupt the shadow tables)."""
     conn.execute("INSERT INTO folders_fts(folders_fts) VALUES('rebuild')")
+    conn.execute("INSERT INTO files_fts(files_fts) VALUES('rebuild')")
     conn.commit()

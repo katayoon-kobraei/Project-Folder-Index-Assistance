@@ -26,12 +26,13 @@ def main():
     conn = open_db(config["db_path"])
 
     start = time.time()
-    stats = crawl(conn, config["root_path"], config)
+    stats = crawl(conn, config)
     conn.close()
 
     elapsed = time.time() - start
     print(f"Finished in {elapsed:.1f}s. Database: {config['db_path']}")
     print(f"Years: {stats['years']}  Folders: {stats['folders']}  "
+          f"Files: {stats['files']}  "
           f"Possible nested revisions: {stats['revision_hints']}")
 
 
