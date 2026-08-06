@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Ubicación — Índice de Proyectos{% endblock %}
+{% block content %}
+<a href="/locations" class="text-sm text-gray-500 hover:text-gray-900">&larr; Volver a ubicaciones</a>
+<h1 id="location-title" class="text-lg font-medium mt-2 mb-4">Cargando...</h1>
+<div id="cy" style="width: 100%; height: 520px; border: 1px solid #e5e7eb; border-radius: 8px;"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
+<script>
+const locationId = {{ location_id }};
+
+async function loadGraph() {
+  const res = await fetch(`/api/location/${locationId}/graph`);
+  if (!res.ok) {
+    document.getElementById("location-title").textContent = "Ubicación no encontrada";
+    return;
+  }
+  const data = await res.json();
+  document.getElementById("location-title").textContent = data.location.name;
+
+  const cy = cytoscape({
+    container: document.getElementById("cy"),
+    elements: data.elements,
+    style: [
+      {
+        selector: "node[type='location']",
+        style: {
+          "background-color": "#185fa5",
+          "label": "data(label)",
+          "color": "#fff",
+          "text-valign": "center",
+          "font-size": 12,
+          "width": 48,
+          "height": 48,
+        },
+      },
+      {
+        selector: "node[type='project']",
+        style: {
+          "background-color": "#d1d5db",
+          "label": "data(label)",
+          "font-size": 10,
+          "text-valign": "bottom",
+          "text-margin-y": 4,
+          "width": 20,
+          "height": 20,
+        },
+      },
+      {
+        selector: "edge",
+        style: { "width": 1, "line-color": "#d1d5db", "curve-style": "bezier" },
+      },
+    ],
+    layout: { name: "cose", animate: false },
+  });
+
+  cy.on("tap", "node[type='project']", (evt) => {
+    window.location.href = `/project/${evt.target.data("project_id")}`;
+  });
+}
+
+loadGraph();
+</script>
+{% endblock %}

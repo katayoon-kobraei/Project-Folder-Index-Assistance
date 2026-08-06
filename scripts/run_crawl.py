@@ -1,8 +1,13 @@
 """
 Entry point: `python scripts/run_crawl.py`
+             `python scripts/run_crawl.py --full`   (force a full rescan)
 
 Loads config/config.yaml, opens (or creates) the SQLite database, and runs
-the crawler against root_path.
+the crawler. By default this is incremental (config['incremental'], true
+unless set otherwise) — folders whose modified date hasn't changed since
+last time have their file listing skipped, which is the expensive part on
+a network drive. Pass --full to force a complete rescan regardless of the
+config setting, e.g. for a periodic sanity check.
 """
 
 import sys
@@ -23,6 +28,10 @@ def main():
         sys.exit(1)
 
     config = yaml.safe_load(config_path.read_text())
+    if "--full" in sys.argv:
+        config["incremental"] = False
+        print("Forcing a full rescan (--full) regardless of config.yaml.")
+
     conn = open_db(config["db_path"])
 
     start = time.time()
@@ -32,7 +41,8 @@ def main():
     elapsed = time.time() - start
     print(f"Finished in {elapsed:.1f}s. Database: {config['db_path']}")
     print(f"Years: {stats['years']}  Folders: {stats['folders']}  "
-          f"Files: {stats['files']}  "
+          f"Files written: {stats['files']}  "
+          f"Folders skipped (unchanged): {stats['folders_skipped']}  "
           f"Possible nested revisions: {stats['revision_hints']}")
 
 

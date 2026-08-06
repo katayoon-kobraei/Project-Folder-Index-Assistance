@@ -17,6 +17,24 @@ Folder depth convention (matches src/db/schema.sql), relative to each root:
 Every folder visited also has its own files recorded into the `files`
 table (name, extension, modified date, size) — not recursively, just the
 files sitting directly inside that folder.
+
+Incremental rescans (config['incremental'], default True): a folder's own
+"modified date" only changes when something is directly added, removed,
+or renamed INSIDE it — not when a file several levels deeper changes. So
+if a folder's mtime matches what's already stored from the last crawl,
+its own list of files can safely be skipped this run (nothing was
+added/removed/renamed there since). Every folder still gets walked and
+checked individually every run — a change deep in the tree doesn't
+"bubble up" an mtime change to its ancestors, so skipping recursion based
+on a parent's unchanged mtime would miss it. Only the (expensive, because
+it's per-file network stat calls) file-listing step is skipped, not the
+folder walk itself.
+
+Caveat: this catches files being added/removed/renamed. It does NOT catch
+a file being edited in place (re-saved) without the folder's own entry
+list changing, since that only updates the file's own mtime, not its
+parent folder's. Run occasionally with incremental: false (or
+`--full` on scripts/run_crawl.py) for a guaranteed fully fresh scan.
 """
 
 import os
@@ -33,8 +51,18 @@ from src.db.db import upsert_folder, upsert_file, rebuild_fts
 # (space, dash, or dot) — e.g. "22-007 NAME", "14-001.- NAME", "14-023-NAME".
 JOB_CODE_RE = re.compile(r"^(\d{2}-\d{2,4})[.\-\s]+(.+)$")
 
-# Site code (trabajos): YY-NNN-SS, same flexible separator.
-SITE_CODE_RE = re.compile(r"^(\d{2}-\d{2,4}-\d{1,2})[.\-\s]+(.+)$")
+# Site code (trabajos): a subfolder directly under a job folder is a
+# "site/location" only if its name starts by repeating that job's own
+# code, followed by a separator and a number, e.g. job "14-002" contains
+# site folder "14-002.001 CONSUM LA ZENIA" (dot + 3-digit counter) or the
+# older "22-007-02 CALLE SAN LUIS BELTRAN" (dash + 2-digit counter) style.
+# Deliberately NOT used: some companies (e.g. TOKHEIM) number their site
+# folders "01.- NAME", "02.- NAME" instead of repeating the job code —
+# identical in shape to a plain category folder ("00.-PLANOS", "01.-DOC
+# DE REFERENCIA"), so there's no reliable way to tell those apart from the
+# name alone. Per explicit instruction, those are left unhandled for now
+# (site/location stays NULL) and will be fixed up manually later.
+SITE_SUFFIX_RE = re.compile(r"^([.\-]\s*\d{1,4})[.\-\s]+(.+)$")
 
 # Offer code (ofertas): a plain sequential number, no year/dash — e.g.
 # "001.- NAME", "037.NAME", "013.-NAME".
@@ -70,23 +98,27 @@ def parse_job_folder(name: str):
 
 def parse_site_folder(name: str, job_code: str | None = None):
     """
-    Return (site_code, site_name) if `name` matches 'YY-NNN-SS NAME', else None.
+    Return (site_code, site_name) if `name` starts with the job's own
+    `job_code`, followed by a separator and a number, followed by the
+    actual site name — e.g. job_code="14-002" matches
+    "14-002.001 CONSUM LA ZENIA" -> ("14-002.001", "CONSUM LA ZENIA").
 
-    If `job_code` is given, the site code's job-prefix (everything before
-    the last "-SS" segment) must exactly match it. Without this check, dated
-    filenames like "16-01-29 (ver) 15039 caravanas puzol" or
-    "27-10-15 MJESUS DOÑATE..." — which are just day-month-year dates, not
-    site codes — get misread as sites belonging to an unrelated job.
+    Requiring the literal job_code as a prefix (rather than just any
+    "YY-NNN-SS"-shaped string) is what rejects dated filenames like
+    "16-01-29 (ver) 15039 caravanas puzol" or "27-10-15 MJESUS DOÑATE
+    (ELEVAL) plantas" — they happen to look like codes, but they don't
+    start with the job they're actually sitting under, so they're
+    correctly left unmatched.
     """
-    m = SITE_CODE_RE.match(name)
+    if not job_code or not name.startswith(job_code):
+        return None
+    remainder = name[len(job_code):]
+    m = SITE_SUFFIX_RE.match(remainder)
     if not m:
         return None
-    site_code, site_name = m.groups()
-    if job_code is not None:
-        job_prefix = site_code.rsplit("-", 1)[0]
-        if job_prefix != job_code:
-            return None
-    return site_code, site_name
+    counter_segment, site_name = m.groups()
+    site_code = job_code + counter_segment.strip()
+    return site_code, site_name.strip()
 
 
 def parse_offer_folder(name: str):
@@ -163,9 +195,19 @@ def _row_from_entry(entry, depth, year, job_code, job_name, site_code, site_name
     }
 
 
-def _record_files(conn, folder_path, folder_id, ignore_names: set, stats):
+def _record_files(conn, folder_path, folder_id, ignore_names: set, stats,
+                   company_project, file_year, location_site):
     """Record every file sitting directly inside `folder_path` (not
-    recursive — subfolders get their own call when the walk reaches them)."""
+    recursive — subfolders get their own call when the walk reaches them).
+
+    `company_project` and `file_year` come from the enclosing folder's own
+    row (already inherited down from the depth=1 job/offer folder and the
+    depth=0 year folder respectively by the walk) — every file gets tagged
+    with whichever company/project and year its containing folder belongs
+    to, however deep it's nested. `location_site` is the same kind of
+    inheritance from whichever site folder (if any) matched
+    parse_site_folder() further up the path — NULL for anything above or
+    outside a recognized site folder."""
     for entry in _scan_entries(folder_path, ignore_names):
         try:
             if not entry.is_file(follow_symlinks=False):
@@ -185,12 +227,67 @@ def _record_files(conn, folder_path, folder_id, ignore_names: set, stats):
             "extension": extension,
             "modified_at": modified_at,
             "size_bytes": stat.st_size,
+            "company_project": company_project,
+            "file_year": file_year,
+            "location_site": location_site,
         })
         stats["files"] += 1
 
 
+def _load_existing_modified_map(conn) -> dict:
+    """path -> stored modified_at, loaded once so the incremental check is
+    an in-memory dict lookup rather than one SQL query per folder."""
+    return dict(conn.execute("SELECT path, modified_at FROM folders").fetchall())
+
+
+def _mtime_to_second(iso_str: str | None) -> str | None:
+    """Truncate an ISO timestamp to whole-second precision, dropping the
+    fractional-second part but keeping the timezone suffix — e.g.
+    "2026-08-04T11:27:58.572845+00:00" -> "2026-08-04T11:27:58+00:00".
+
+    Windows/NTFS can report a folder's Last Write Time as still settling
+    for a brief moment after a change — two reads of a genuinely unchanged
+    folder, seconds apart, have been observed to differ by under a
+    millisecond. Comparing at whole-second resolution absorbs that noise.
+    The tradeoff: a real change that happens in the same one-second window
+    as a refresh could in theory be missed until the next refresh — the
+    same accepted limitation already noted for in-place file edits in the
+    module docstring above, and not something that comes up in practice."""
+    if iso_str is None:
+        return None
+    if "." not in iso_str:
+        return iso_str
+    date_part, rest = iso_str.split(".", 1)
+    tz_index = max(rest.find("+"), rest.find("-"))
+    tz_suffix = rest[tz_index:] if tz_index != -1 else ""
+    return date_part + tz_suffix
+
+
+def _maybe_record_files(conn, path, folder_id, ignore_names, stats,
+                         row, existing_modified: dict, incremental: bool):
+    """Record this folder's files, unless incremental mode is on and its
+    mtime (compared to whole-second precision, see _mtime_to_second)
+    matches what was already stored — in which case nothing directly
+    inside it has been added/removed/renamed since last crawl."""
+    previous_mtime = existing_modified.get(row["path"])
+    unchanged = (
+        incremental
+        and previous_mtime is not None
+        and row["modified_at"] is not None
+        and _mtime_to_second(previous_mtime) == _mtime_to_second(row["modified_at"])
+    )
+    if unchanged:
+        stats["folders_skipped"] += 1
+        return
+    _record_files(conn, path, folder_id, ignore_names, stats,
+                  company_project=row["job_name"], file_year=row["year"],
+                  location_site=row["site_name"])
+    stats["folders_rescanned"] += 1
+
+
 def _walk_children(conn, parent_path, parent_depth, year, job_code, job_name,
-                    site_code, site_name, ignore_names, stats, code_kind, source):
+                    site_code, site_name, ignore_names, stats, code_kind, source,
+                    existing_modified: dict, incremental: bool):
     this_depth = parent_depth + 1
     for entry in _scan_dirs(parent_path, ignore_names):
         new_job_code, new_job_name = job_code, job_name
@@ -215,18 +312,24 @@ def _walk_children(conn, parent_path, parent_depth, year, job_code, job_name,
         stats["folders"] += 1
         if row["is_revision_hint"]:
             stats["revision_hints"] += 1
-        _record_files(conn, entry.path, folder_id, ignore_names, stats)
+        _maybe_record_files(conn, entry.path, folder_id, ignore_names, stats,
+                             row, existing_modified, incremental)
 
         if stats["folders"] % 500 == 0:
-            print(f"  ...{stats['folders']} folders, {stats['files']} files indexed")
+            print(f"  ...{stats['folders']} folders, {stats['files']} files indexed "
+                  f"({stats['folders_skipped']} folders skipped, unchanged)")
 
         # entry.path already carries the \\?\ prefix if the parent scan did,
         # so long-path support propagates automatically down the recursion.
+        # Every folder is still walked and checked individually every run —
+        # only the file-listing step inside it is what gets skipped.
         _walk_children(conn, entry.path, this_depth, year, new_job_code, new_job_name,
-                        new_site_code, new_site_name, ignore_names, stats, code_kind, source)
+                        new_site_code, new_site_name, ignore_names, stats, code_kind, source,
+                        existing_modified, incremental)
 
 
-def _crawl_root(conn, root_spec: dict, ignore_names: set, stats: dict):
+def _crawl_root(conn, root_spec: dict, ignore_names: set, stats: dict,
+                 existing_modified: dict, incremental: bool):
     root_path = root_spec["root_path"]
     year_pattern = re.compile(root_spec["year_folder_pattern"])
     code_kind = root_spec.get("code_kind", "job")
@@ -245,10 +348,12 @@ def _crawl_root(conn, root_spec: dict, ignore_names: set, stats: dict):
         year_row = _row_from_entry(entry, 0, year, None, None, None, None, source)
         folder_id = upsert_folder(conn, year_row)
         stats["folders"] += 1
-        _record_files(conn, entry.path, folder_id, ignore_names, stats)
+        _maybe_record_files(conn, entry.path, folder_id, ignore_names, stats,
+                             year_row, existing_modified, incremental)
 
         _walk_children(conn, entry.path, 0, year, None, None, None, None,
-                        ignore_names, stats, code_kind, source)
+                        ignore_names, stats, code_kind, source,
+                        existing_modified, incremental)
 
 
 def crawl(conn, config: dict) -> dict:
@@ -256,18 +361,31 @@ def crawl(conn, config: dict) -> dict:
     Walk every root defined in config['roots'], each with its own
     root_path / year_folder_pattern / code_kind ('job' or 'offer'), and
     write every folder and file found beneath them into the database.
+
+    config['incremental'] (default True) skips re-listing files for
+    folders whose mtime hasn't changed since the last crawl — see the
+    module docstring for exactly what this does and doesn't catch.
+
     Returns a small stats dict.
     """
     ignore_names = set(config.get("ignore_names", []))
-    stats = {"years": 0, "folders": 0, "files": 0, "revision_hints": 0}
+    incremental = config.get("incremental", True)
+    existing_modified = _load_existing_modified_map(conn) if incremental else {}
+
+    stats = {
+        "years": 0, "folders": 0, "files": 0, "revision_hints": 0,
+        "folders_skipped": 0, "folders_rescanned": 0,
+    }
 
     for root_spec in config["roots"]:
-        _crawl_root(conn, root_spec, ignore_names, stats)
+        _crawl_root(conn, root_spec, ignore_names, stats, existing_modified, incremental)
 
     conn.commit()
     print("Rebuilding search index...")
     rebuild_fts(conn)
-    print(f"Done. {stats['years']} year folders, {stats['folders']} folders, "
-          f"{stats['files']} files total, "
+    mode = "incremental" if incremental else "full"
+    print(f"Done ({mode}). {stats['years']} year folders, {stats['folders']} folders, "
+          f"{stats['files']} files written, "
+          f"{stats['folders_skipped']} folders skipped as unchanged, "
           f"{stats['revision_hints']} flagged as possible nested revisions.")
     return stats

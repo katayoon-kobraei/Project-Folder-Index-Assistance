@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block title %}Proyecto — Índice de Proyectos{% endblock %}
+{% block content %}
+<a href="/" class="text-sm text-gray-500 hover:text-gray-900">&larr; Volver a la búsqueda</a>
+<div id="project-container" class="mt-4">Cargando...</div>
+
+<script>
+const projectId = {{ project_id }};
+
+const PHASE_LABELS = { "direccion_obra": "Dirección de obra" };
+const STATUS_LABELS = { "unknown": "Desconocido", "active": "Activo", "dormant": "Inactivo", "completed": "Completado" };
+const SOURCE_LABELS = { "trabajos": "Trabajos", "ofertas": "Ofertas" };
+const MAIN_COLOR = "#0F6E56";
+const PHASE_COLORS = { "direccion_obra": "#534AB7" };
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function buildTimeline(data) {
+  const years = data.links.map(l => l.year).filter(y => y !== null && y !== undefined);
+  if (years.length === 0) {
+    return `<p class="text-sm text-gray-400">Sin fechas registradas.</p>`;
+  }
+
+  const minYear = Math.min(...years);
+  const maxYear = Math.max(...years);
+  const byYear = {};
+  data.links.forEach(l => {
+    const y = l.year ?? "sin-año";
+    (byYear[y] = byYear[y] || []).push(l);
+  });
+
+  let cols = "";
+  for (let y = minYear; y <= maxYear; y++) {
+    const linksThisYear = byYear[y] || [];
+    const dots = linksThisYear.length
+      ? linksThisYear.map(l => {
+          const color = l.phase ? (PHASE_COLORS[l.phase] ?? "#888888") : MAIN_COLOR;
+          const title = escapeHtml(`${l.job_code ?? ""} ${l.job_name ?? ""}`.trim());
+          return `<div style="width:10px;height:10px;border-radius:50%;background:${color}" title="${title}"></div>`;
+        }).join("")
+      : `<div style="width:8px;height:8px;border-radius:50%;background:#e5e7eb"></div>`;
+    const codeLabel = linksThisYear.map(l => l.job_code).filter(Boolean).join(" · ");
+
+    cols += `
+      <div class="flex flex-col items-center gap-1" style="min-width:64px">
+        <span class="text-xs text-gray-400">${y}</span>
+        <div class="flex gap-1">${dots}</div>
+        <span class="text-xs text-gray-400 text-center">${escapeHtml(codeLabel)}</span>
+      </div>
+    `;
+  }
+
+  return `
+    <div class="border rounded bg-white px-4 py-6 overflow-x-auto">
+      <div class="flex items-start gap-2" style="min-width: max-content;">${cols}</div>
+    </div>
+    <div class="flex gap-4 mt-3">
+      <div class="flex items-center gap-2">
+        <div style="width:8px;height:8px;border-radius:50%;background:${MAIN_COLOR}"></div>
+        <span class="text-xs text-gray-500">Fase principal</span>
+      </div>
+      <div class="flex items-center gap-2">
+        <div style="width:8px;height:8px;border-radius:50%;background:${PHASE_COLORS.direccion_obra}"></div>
+        <span class="text-xs text-gray-500">Dirección de obra</span>
+      </div>
+    </div>
+  `;
+}
+
+async function loadProject() {
+  const res = await fetch(`/api/project/${projectId}`);
+  const container = document.getElementById("project-container");
+  if (!res.ok) {
+    container.innerHTML = `<p class="text-sm text-red-500">Proyecto no encontrado.</p>`;
+    return;
+  }
+  const data = await res.json();
+
+  const locationsHtml = data.locations.map(loc => `
+    <a href="/location/${loc.id}" class="text-xs bg-gray-100 px-2 py-1 rounded hover:bg-gray-200">${escapeHtml(loc.name)}</a>
+  `).join(" ");
+
+  const linksHtml = data.links.map(l => `
+    <div class="flex items-center gap-3 border rounded px-3 py-2 bg-white">
+      <span class="text-sm text-gray-500 w-14">${l.year ?? "?"}</span>
+      <span class="text-sm font-medium">${escapeHtml(l.job_code)} ${escapeHtml(l.job_name)}</span>
+      ${l.phase ? `<span class="text-xs bg-purple-100 text-purple-700 px-2 py-0.5 rounded">${PHASE_LABELS[l.phase] ?? escapeHtml(l.phase)}</span>` : ""}
+      <span class="text-xs text-gray-400 ml-auto">${SOURCE_LABELS[l.source] ?? escapeHtml(l.source)}</span>
+    </div>
+  `).join("");
+
+  container.innerHTML = `
+    <h1 class="text-lg font-medium mb-1">${escapeHtml(data.canonical_name)}</h1>
+    <p class="text-sm text-gray-500 mb-4">${data.first_seen_year ?? "?"} - ${data.last_seen_year ?? "?"} &middot; ${STATUS_LABELS[data.status] ?? escapeHtml(data.status)}</p>
+    <div class="flex flex-wrap gap-2 mb-6">${locationsHtml}</div>
+    <h2 class="text-sm font-medium text-gray-500 mb-2">Historial por año</h2>
+    ${buildTimeline(data)}
+    <h2 class="text-sm font-medium text-gray-500 mt-6 mb-2">Carpetas vinculadas</h2>
+    <div class="flex flex-col gap-2">${linksHtml}</div>
+  `;
+}
+
+loadProject();
+</script>
+{% endblock %}

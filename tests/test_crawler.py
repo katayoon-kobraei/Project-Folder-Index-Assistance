@@ -4,6 +4,7 @@ Run with: pytest
 """
 
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -35,11 +36,21 @@ def test_parse_job_folder():
 
 
 def test_parse_site_folder():
-    assert parse_site_folder("22-007-02 CALLE SAN LUIS BELTRAN") == (
+    # A site is only recognized when the subfolder name starts by
+    # repeating its own job's job_code — job_code is now required, not
+    # optional, since that prefix match IS the detection rule.
+    assert parse_site_folder("22-007-02 CALLE SAN LUIS BELTRAN", job_code="22-007") == (
         "22-007-02",
         "CALLE SAN LUIS BELTRAN",
     )
-    assert parse_site_folder("22-007 AYTO TORRENT") is None
+    assert parse_site_folder("22-007 AYTO TORRENT", job_code="22-007") is None
+    assert parse_site_folder("22-007-02 CALLE SAN LUIS BELTRAN") is None  # no job_code given
+
+    # Real formatting variant: dot + 3-digit counter instead of dash + 2-digit.
+    assert parse_site_folder("14-002.001 CONSUM LA ZENIA", job_code="14-002") == (
+        "14-002.001",
+        "CONSUM LA ZENIA",
+    )
 
     # Real formatting variant: no space, dash-joined straight into the name.
     assert parse_site_folder("22-013-01-ALDI ALFAS BARRANCO", job_code="22-013") == (
@@ -48,12 +59,18 @@ def test_parse_site_folder():
     )
 
     # Dates that happen to look like site codes (day-month-year, e.g. a
-    # file named "16-01-29 (ver) ...") must be rejected because their
-    # job-code prefix doesn't match the job they're actually sitting under.
+    # file named "16-01-29 (ver) ...") must be rejected because they don't
+    # start with the job they're actually sitting under.
     assert parse_site_folder("16-01-29 (ver) 15039 caravanas puzol", job_code="14-047") is None
     assert parse_site_folder(
         "27-10-15 MJESUS DOÑATE (ELEVAL) plantas", job_code="15-010"
     ) is None
+
+    # TOKHEIM-style site folders ("01.- COOPERATIVA MONTROY") don't repeat
+    # the job code at all — identical in shape to a plain category folder
+    # ("00.-PLANOS"), so they're correctly left unmatched here. Per explicit
+    # instruction this is a known, accepted gap to be fixed manually later.
+    assert parse_site_folder("01.- COOPERATIVA MONTROY", job_code="14-004") is None
 
 
 def test_parse_offer_folder():
@@ -262,5 +279,74 @@ def test_fts_search_finds_by_partial_name(tmp_path):
         "SELECT rowid FROM files_fts WHERE files_fts MATCH 'plan'"
     ).fetchall()
     assert len(file_results) >= 1
+
+    conn.close()
+
+
+def test_incremental_skips_unchanged_folders_on_rescan(tmp_path):
+    _make_fake_archive(tmp_path)
+    db_path = tmp_path / "index.db"
+    conn = open_db(str(db_path))
+    config = _config(tmp_path)
+
+    first = crawl(conn, config)
+    assert first["folders_skipped"] == 0  # nothing to compare against yet
+    assert first["files"] > 0
+
+    # Nothing on disk changed — a second run should skip re-listing files
+    # for every folder, since every folder's mtime still matches what's
+    # already stored.
+    second = crawl(conn, config)
+    assert second["folders_skipped"] == second["folders"]
+    assert second["folders_rescanned"] == 0
+    assert second["files"] == 0  # no files re-written this run
+
+    conn.close()
+
+
+def test_incremental_still_detects_a_new_file(tmp_path):
+    _make_fake_archive(tmp_path)
+    db_path = tmp_path / "index.db"
+    conn = open_db(str(db_path))
+    config = _config(tmp_path)
+
+    crawl(conn, config)
+
+    # The incremental check now compares timestamps at whole-second
+    # precision (see _mtime_to_second in crawl.py — added specifically to
+    # absorb the sub-millisecond Windows/NTFS settling noise seen while
+    # debugging this). That means a real change happening in the very
+    # same second as the previous crawl could in theory round to an
+    # identical value — so this test waits just over a second to
+    # guarantee the new file's timestamp lands in a different second
+    # than what was already stored.
+    time.sleep(1.1)
+
+    # Add a new file directly inside an existing, already-indexed folder —
+    # this bumps that folder's own mtime, so it must NOT be skipped.
+    site_dir = tmp_path / "TRABAJOS" / "TRABAJOS 2022" / "22-007 AYTO TORRENT" / "22-007-02 CALLE SAN LUIS BELTRAN"
+    (site_dir / "nueva_nota.txt").write_text("added after the first crawl")
+
+    second = crawl(conn, config)
+    assert second["folders_skipped"] < second["folders"]  # at least this one got rescanned
+
+    names = {r[0] for r in conn.execute("SELECT name FROM files")}
+    assert "nueva_nota.txt" in names
+
+    conn.close()
+
+
+def test_full_flag_forces_complete_rescan(tmp_path):
+    _make_fake_archive(tmp_path)
+    db_path = tmp_path / "index.db"
+    conn = open_db(str(db_path))
+    config = _config(tmp_path)
+
+    crawl(conn, config)
+
+    config["incremental"] = False
+    second = crawl(conn, config)
+    assert second["folders_skipped"] == 0
+    assert second["files"] > 0  # everything re-listed despite being unchanged
 
     conn.close()

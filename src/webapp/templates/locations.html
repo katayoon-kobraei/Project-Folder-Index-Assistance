@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Ubicaciones — Índice de Proyectos{% endblock %}
+{% block content %}
+<h1 class="text-lg font-medium mb-4">Ubicaciones</h1>
+<div id="location-list" class="flex flex-col gap-2"></div>
+
+<script>
+async function loadLocations() {
+  const res = await fetch("/api/locations");
+  const data = await res.json();
+  document.getElementById("location-list").innerHTML = data.map(l => `
+    <a href="/location/${l.id}" class="border rounded px-4 py-3 bg-white hover:bg-gray-50 flex justify-between items-center">
+      <span class="font-medium">${l.name}</span>
+      <span class="text-sm text-gray-500">${l.project_count} proyectos</span>
+    </a>
+  `).join("");
+}
+loadLocations();
+</script>
+{% endblock %}

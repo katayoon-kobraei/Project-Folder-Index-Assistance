@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% block title %}Buscar — Índice de Proyectos{% endblock %}
+{% block content %}
+<div class="flex items-center justify-between mb-4">
+  <h1 class="text-lg font-medium">Buscar proyectos</h1>
+  <button id="refresh-btn" class="border rounded px-3 py-1.5 text-sm hover:bg-gray-100">
+    Actualizar
+  </button>
+</div>
+
+<div id="refresh-banner" class="hidden mb-4 border rounded px-4 py-3 text-sm"></div>
+
+<input id="search-input" type="text" placeholder="Buscar proyectos..."
+       class="border rounded px-3 py-2 w-full mb-4" autofocus />
+<div id="results" class="flex flex-col gap-2"></div>
+
+<script>
+const input = document.getElementById("search-input");
+const results = document.getElementById("results");
+const refreshBtn = document.getElementById("refresh-btn");
+const refreshBanner = document.getElementById("refresh-banner");
+
+const STAGE_LABELS = {
+  "crawling": "Recorriendo las carpetas...",
+  "resolving_projects": "Agrupando proyectos...",
+  "detecting_locations": "Detectando ubicaciones...",
+};
+
+async function runSearch(q) {
+  const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+  const data = await res.json();
+  if (data.length === 0) {
+    results.innerHTML = `<p class="text-sm text-gray-400">No se encontraron proyectos.</p>`;
+    return;
+  }
+  results.innerHTML = data.map(p => `
+    <a href="/project/${p.id}" class="border rounded px-4 py-3 bg-white hover:bg-gray-50 block">
+      <div class="font-medium">${p.canonical_name}</div>
+      <div class="text-sm text-gray-500">${p.first_seen_year ?? "?"} - ${p.last_seen_year ?? "?"}</div>
+    </a>
+  `).join("");
+}
+
+let debounceTimer;
+input.addEventListener("input", () => {
+  clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(() => runSearch(input.value), 150);
+});
+
+function showBanner(text, kind) {
+  const colors = {
+    info: "bg-blue-50 border-blue-200 text-blue-800",
+    success: "bg-green-50 border-green-200 text-green-800",
+    error: "bg-red-50 border-red-200 text-red-800",
+  };
+  refreshBanner.className = `mb-4 border rounded px-4 py-3 text-sm ${colors[kind]}`;
+  refreshBanner.textContent = text;
+}
+
+function hideBanner() {
+  refreshBanner.className = "hidden mb-4 border rounded px-4 py-3 text-sm";
+}
+
+let pollTimer;
+
+async function pollStatus() {
+  const res = await fetch("/api/refresh/status");
+  const status = await res.json();
+
+  if (status.status === "running") {
+    refreshBtn.disabled = true;
+    refreshBtn.classList.add("opacity-50", "cursor-not-allowed");
+    showBanner(
+      `${STAGE_LABELS[status.stage] ?? "Actualizando..."} Esto puede tardar varios minutos, la base de datos completa se está recorriendo de nuevo.`,
+      "info"
+    );
+    pollTimer = setTimeout(pollStatus, 3000);
+    return;
+  }
+
+  refreshBtn.disabled = false;
+  refreshBtn.classList.remove("opacity-50", "cursor-not-allowed");
+
+  if (status.status === "done" && status.stats) {
+    showBanner(
+      `Actualizado: ${status.stats.folders} carpetas, ${status.stats.files} archivos, ${status.stats.projects} proyectos, ${status.stats.locations} ubicaciones.`,
+      "success"
+    );
+    runSearch(input.value);
+    setTimeout(hideBanner, 8000);
+  } else if (status.status === "error") {
+    showBanner(`Error al actualizar: ${status.error}`, "error");
+  }
+}
+
+refreshBtn.addEventListener("click", async () => {
+  const res = await fetch("/api/refresh", { method: "POST" });
+  if (res.status === 409) {
+    showBanner("Ya hay una actualización en curso.", "info");
+    pollStatus();
+    return;
+  }
+  pollStatus();
+});
+
+// Pick up an in-progress refresh if the page is loaded/reloaded mid-run.
+(async () => {
+  const res = await fetch("/api/refresh/status");
+  const status = await res.json();
+  if (status.status === "running") pollStatus();
+})();
+
+runSearch("");
+</script>
+{% endblock %}
