@@ -250,13 +250,15 @@ class ProjectsPage(QWidget):
 
 
 class SearchPage(QWidget):
-    """One search box, two result sets — both over the raw filesystem,
-    not the resolved projects table: matching FOLDERS (by the folder's
-    own name/address, e.g. a site folder named after a street, via
+    """One search box plus a year/company filter row (same idea as
+    Proyectos), two result sets — both over the raw filesystem, not the
+    resolved projects table: matching FOLDERS (by the folder's own
+    name/address, e.g. a site folder named after a street, via
     folders_fts) and matching individual FILES (via files_fts). Neither
     searches project canonical names — that's what the Proyectos page's
-    own filter is for. Both update together on the same debounced
-    keystroke, and both are empty until you actually type something."""
+    own filter is for. All three inputs (text, year, company) narrow the
+    same two result sets together; both stay empty until at least one of
+    them is actually set."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -273,10 +275,32 @@ class SearchPage(QWidget):
         self.search.textChanged.connect(self._on_text_changed)
         outer.addWidget(self.search)
 
+        filters_row = QHBoxLayout()
+        filters_row.setSpacing(10)
+
+        filters_label = QLabel("Filtros:")
+        filters_label.setObjectName("MetricTitle")
+        filters_row.addWidget(filters_label)
+
+        self.year_filter = QComboBox()
+        self.year_filter.addItem("Todos los años", None)
+        self.year_filter.currentIndexChanged.connect(self._on_filters_changed)
+        filters_row.addWidget(self.year_filter)
+
+        self.company_filter = QLineEdit()
+        self.company_filter.setPlaceholderText("Filtrar por empresa/proyecto...")
+        self.company_filter.textChanged.connect(self._on_text_changed)
+        filters_row.addWidget(self.company_filter, 1)
+
+        outer.addLayout(filters_row)
+
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(250)
         self._debounce.timeout.connect(self._run_search)
+
+        self._years_loaded = False
+        self._load_years()
 
         folders_title = QLabel("Carpetas")
         folders_title.setObjectName("SectionTitle")
@@ -290,6 +314,13 @@ class SearchPage(QWidget):
         self.table.setHorizontalHeaderLabels(["Carpeta", "Proyecto", "Año", "Ubicación", "Ruta"])
         configure_table(self.table)
         self._set_fixed_result_column_widths(self.table)
+        # Ruta needs to show the FULL path, even past the edge of the
+        # window — stretchLastSection (on by default from configure_table)
+        # caps the last column at the visible width, which is exactly
+        # what was truncating it. Turning it off lets the column grow to
+        # its real content width instead, with the table's own
+        # horizontal scrollbar handling anything wider than the window.
+        self.table.horizontalHeader().setStretchLastSection(False)
         self.table.doubleClicked.connect(self._open_selected_folder)
         outer.addWidget(self.table, 1)
 
@@ -307,6 +338,11 @@ class SearchPage(QWidget):
         )
         configure_table(self.files_table)
         self._set_fixed_result_column_widths(self.files_table)
+        # Carpeta (the file's containing path) needs to show in FULL too,
+        # same reasoning as Ruta on the Carpetas table above — turn off
+        # stretchLastSection so the column can grow past the window
+        # edge, with the table's own horizontal scrollbar taking over.
+        self.files_table.horizontalHeader().setStretchLastSection(False)
         self.files_table.doubleClicked.connect(self._open_selected_file)
         outer.addWidget(self.files_table, 1)
 
@@ -316,40 +352,61 @@ class SearchPage(QWidget):
 
     @staticmethod
     def _set_fixed_result_column_widths(table: QTableWidget) -> None:
-        # Fixed widths set ONCE, not recomputed from cell contents on
-        # every keystroke: resizeColumnsToContents() has to measure text
-        # width for every cell (up to 300 rows × 5 columns, one of them a
-        # full P:\ path), which was the single slowest step in the whole
-        # search — everything else (the FTS query itself) is under
-        # ~100ms even for a broad match. The last column fills the rest
-        # via setStretchLastSection (already on in configure_table).
+        # Fixed widths for the middle columns, set ONCE rather than
+        # recomputed from cell contents on every keystroke — the one
+        # column each table needs shown in FULL (Ruta / Archivo) is
+        # separately sized to its actual content in _render()/
+        # _render_files() instead, which is cheap for a single column.
         table.setColumnWidth(0, 260)
         table.setColumnWidth(1, 200)
         table.setColumnWidth(2, 60)
         table.setColumnWidth(3, 160)
 
+    def _load_years(self) -> None:
+        if self._years_loaded:
+            return
+        try:
+            years = data_service.available_years()
+        except Exception:
+            years = []
+        for year in years:
+            self.year_filter.addItem(str(year), year)
+        self._years_loaded = True
+
     def _on_text_changed(self) -> None:
         self._debounce.start()
 
+    def _on_filters_changed(self) -> None:
+        self._run_search()
+
     def _run_search(self) -> None:
         query = self.search.text().strip()
+        year = self.year_filter.currentData()
+        company_query = self.company_filter.text().strip()
         try:
-            self._rows = data_service.folders(query, FILE_SEARCH_LIMIT)
+            self._rows = data_service.folders(query, FILE_SEARCH_LIMIT, year, company_query)
         except Exception as exc:
             QMessageBox.critical(self, "Error al buscar carpetas", str(exc))
             self._rows = []
         try:
-            self._file_rows = data_service.files(query, FILE_SEARCH_LIMIT)
+            self._file_rows = data_service.files(query, FILE_SEARCH_LIMIT, year, company_query)
         except Exception as exc:
             QMessageBox.critical(self, "Error al buscar archivos", str(exc))
             self._file_rows = []
         self._render()
         self._render_files()
 
+    def _has_any_filter(self) -> bool:
+        return bool(
+            self.search.text().strip()
+            or self.year_filter.currentData() is not None
+            or self.company_filter.text().strip()
+        )
+
     def _render(self) -> None:
         total = len(self._rows)
-        if not self.search.text().strip():
-            self.count_label.setText("Escribe para buscar carpetas por nombre.")
+        if not self._has_any_filter():
+            self.count_label.setText("Escribe o filtra para buscar carpetas.")
         elif total >= FILE_SEARCH_LIMIT:
             self.count_label.setText(
                 f"Mostrando las primeras {total} carpetas — afina la búsqueda para ver menos."
@@ -365,12 +422,17 @@ class SearchPage(QWidget):
             self.table.setItem(row_idx, 2, QTableWidgetItem(str(folder.get("year") or "?")))
             self.table.setItem(row_idx, 3, QTableWidgetItem(folder.get("location_site") or ""))
             self.table.setItem(row_idx, 4, QTableWidgetItem(folder["path"]))
+        # Only this one column, not resizeColumnsToContents() for all
+        # five — measuring just the path column is a few ms even at 300
+        # rows (confirmed), vs. the near-hang measuring every column
+        # caused earlier when it ran on every keystroke.
+        self.table.resizeColumnToContents(4)
         self.table.setUpdatesEnabled(True)
 
     def _render_files(self) -> None:
         total = len(self._file_rows)
-        if not self.search.text().strip():
-            self.files_count_label.setText("Escribe para buscar archivos por nombre.")
+        if not self._has_any_filter():
+            self.files_count_label.setText("Escribe o filtra para buscar archivos.")
         elif total >= FILE_SEARCH_LIMIT:
             self.files_count_label.setText(
                 f"Mostrando los primeros {total} resultados — afina la búsqueda para ver menos."
@@ -386,9 +448,14 @@ class SearchPage(QWidget):
             self.files_table.setItem(row_idx, 2, QTableWidgetItem(str(f.get("file_year") or "?")))
             self.files_table.setItem(row_idx, 3, QTableWidgetItem(f.get("location_site") or ""))
             self.files_table.setItem(row_idx, 4, QTableWidgetItem(f["path"]))
+        # Only these two columns, same reasoning as the Carpetas table
+        # above — cheap for a couple of columns, not for all five.
+        self.files_table.resizeColumnToContents(0)
+        self.files_table.resizeColumnToContents(4)
         self.files_table.setUpdatesEnabled(True)
 
     def refresh(self) -> None:
+        self._load_years()
         self._run_search()
 
     def _open_path(self, path: str, what: str) -> None:

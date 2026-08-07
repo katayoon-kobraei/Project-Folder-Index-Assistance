@@ -300,6 +300,62 @@ def test_search_folders_handles_punctuation_safely(tmp_path):
     conn.close()
 
 
+def test_search_folders_year_and_company_filters(tmp_path):
+    conn = open_db(str(tmp_path / "index.db"))
+    _seed(conn)
+    _insert_folder(
+        conn, "/f/1/25-003-02 CL BENITO PEREZ", "25-003-02 CL BENITO PEREZ",
+        year=2025, company_project="PLENOIL",
+    )
+    _insert_folder(
+        conn, "/f/1/19-010-01 CL BENITO PEREZ", "19-010-01 CL BENITO PEREZ",
+        year=2019, company_project="CONSUM",
+    )
+    conn.commit()
+    rebuild_fts(conn)
+
+    # Text + year together: only the 2025 PLENOIL folder matches, not the
+    # 2019 CONSUM one, even though both contain "benito perez".
+    results = search_folders(conn, "benito perez", year=2025)
+    assert [r["name"] for r in results] == ["25-003-02 CL BENITO PEREZ"]
+
+    # Company filter alone (no text, no year) must still return matches —
+    # Buscar's filter row works even before anything is typed.
+    results = search_folders(conn, company_query="CONSUM")
+    assert [r["name"] for r in results] == ["19-010-01 CL BENITO PEREZ"]
+
+    # All three empty -> nothing, same as before.
+    assert search_folders(conn) == []
+
+    conn.close()
+
+
+def test_search_files_year_and_company_filters(tmp_path):
+    conn = open_db(str(tmp_path / "index.db"))
+    _seed(conn)
+    folder_id = conn.execute("SELECT id FROM folders LIMIT 1").fetchone()[0]
+    _insert_file(
+        conn, folder_id, "/f/1/Factura 2025.pdf", "Factura 2025.pdf",
+        file_year=2025, company_project="PLENOIL",
+    )
+    _insert_file(
+        conn, folder_id, "/f/1/Factura 2019.pdf", "Factura 2019.pdf",
+        file_year=2019, company_project="CONSUM",
+    )
+    conn.commit()
+    rebuild_fts(conn)
+
+    results = search_files(conn, "factura", year=2025)
+    assert [r["name"] for r in results] == ["Factura 2025.pdf"]
+
+    results = search_files(conn, company_query="CONSUM")
+    assert [r["name"] for r in results] == ["Factura 2019.pdf"]
+
+    assert search_files(conn) == []
+
+    conn.close()
+
+
 def test_get_project_detail(tmp_path):
     conn = open_db(str(tmp_path / "index.db"))
     project_id, location_id = _seed(conn)

@@ -54,12 +54,22 @@ def _fts_prefix_query(text: str) -> str | None:
     return " ".join('"' + t.replace('"', '""') + '"*' for t in tokens)
 
 
-def search_files(conn, query: str = "", limit: int = 300):
+def search_files(
+    conn,
+    query: str = "",
+    limit: int = 300,
+    year: int | None = None,
+    company_query: str = "",
+):
     """Full-text search over every indexed FILE name (not just project
     names), via the files_fts FTS5 index that's rebuilt after every
     crawl — this is what lets Buscar find an individual file instead of
     only a company/project, and stays fast even across ~600k files
     (single-digit milliseconds, vs. a plain LIKE '%...%' table scan).
+    Optionally narrowed further by an exact `year` (file_year) and/or a
+    `company_query` substring against company_project — same filters
+    Buscar's Proyectos-style filter row offers, applied on top of the
+    text search here rather than replacing it.
 
     Deliberately NOT ordered by year/name: for a broad term like "pdf"
     that matches 100k+ files, sorting the full matching set before
@@ -70,22 +80,45 @@ def search_files(conn, query: str = "", limit: int = 300):
     back in whatever order SQLite finds them; a narrower query (which is
     also just more useful) naturally comes back near-instant either way.
 
-    Empty query returns nothing — unlike search_projects, dumping the
-    first `limit` of ~600k files in no meaningful order isn't useful."""
+    Returns nothing if query/year/company_query are ALL empty — unlike
+    search_projects, dumping the first `limit` of ~600k files in no
+    meaningful order isn't useful."""
     match_expr = _fts_prefix_query(query)
-    if match_expr is None:
+    if match_expr is None and year is None and not company_query:
         return []
+
+    conditions = []
+    params: list = []
+    if match_expr is not None:
+        # A subquery, not a JOIN against files_fts directly: combining an
+        # FTS5 MATCH with an indexed equality filter (year, once
+        # idx_files_file_year exists) can make SQLite's planner drive the
+        # query off the year index instead of the FTS index, falling
+        # back to an FTS SCAN per candidate row — 7+ seconds for a query
+        # that resolves in ~2ms on its own. Computing the MATCH as its
+        # own subquery first keeps it on the fast, dedicated FTS index
+        # no matter what other filters get combined with it.
+        conditions.append("f.id IN (SELECT rowid FROM files_fts WHERE files_fts MATCH ?)")
+        params.append(match_expr)
+    if year is not None:
+        conditions.append("f.file_year = ?")
+        params.append(year)
+    if company_query:
+        conditions.append("f.company_project LIKE ?")
+        params.append(f"%{company_query}%")
+    where_sql = " AND ".join(conditions)
+    params.append(limit)
+
     rows = conn.execute(
-        """
+        f"""
         SELECT f.id, f.name, f.extension, f.path, f.company_project,
                f.file_year, f.location_site, fo.source
-        FROM files_fts
-        JOIN files f ON f.id = files_fts.rowid
+        FROM files f
         JOIN folders fo ON fo.id = f.folder_id
-        WHERE files_fts MATCH ?
+        WHERE {where_sql}
         LIMIT ?
         """,
-        (match_expr, limit),
+        params,
     ).fetchall()
     return [
         {
@@ -102,7 +135,13 @@ def search_files(conn, query: str = "", limit: int = 300):
     ]
 
 
-def search_folders(conn, query: str = "", limit: int = 300):
+def search_folders(
+    conn,
+    query: str = "",
+    limit: int = 300,
+    year: int | None = None,
+    company_query: str = "",
+):
     """Full-text search over every indexed FOLDER's own name — via
     folders_fts, rebuilt after every crawl — instead of the resolved
     projects table. This is what Buscar's top results use now: a
@@ -110,7 +149,9 @@ def search_folders(conn, query: str = "", limit: int = 300):
     ALZIRA' never appears in a resolved project's canonical name (that
     project might just be called 'PLENOIL'), so searching projects.
     canonical_name alone missed it entirely — searching every folder's
-    own name finds it directly, at every depth.
+    own name finds it directly, at every depth. Optionally narrowed
+    further by an exact `year` and/or a `company_query` substring
+    against company_project, same as search_files.
 
     Deliberately restricted to the `name` column only, via FTS5's
     `name: ...` column filter — folders_fts also indexes job_name and
@@ -123,22 +164,42 @@ def search_folders(conn, query: str = "", limit: int = 300):
     match is still shown via the company_project/location_site columns
     below — just not used to decide whether something matches at all.
 
-    Same reasoning as search_files for the rest: empty query returns
-    nothing, and results are deliberately unordered (see search_files'
-    docstring — sorting the full matching set before LIMIT was the
-    actual slow part for a broad term, not the FTS match itself)."""
+    Returns nothing if query/year/company_query are ALL empty, and
+    results are deliberately unordered — same reasoning as search_files
+    (sorting the full matching set before LIMIT was the actual slow part
+    for a broad term, not the FTS match itself)."""
     match_expr = _fts_prefix_query(query)
-    if match_expr is None:
+    if match_expr is None and year is None and not company_query:
         return []
+
+    conditions = []
+    params: list = []
+    if match_expr is not None:
+        # Subquery, not a direct JOIN — same reasoning as search_files:
+        # combining an FTS5 MATCH with the year index directly in one
+        # query let SQLite's planner drive off the year index and fall
+        # back to a slow per-row FTS scan instead of using the FTS
+        # index properly (measured 0.73s vs. under 1ms restructured this
+        # way for the exact same query).
+        conditions.append("f.id IN (SELECT rowid FROM folders_fts WHERE folders_fts MATCH 'name: ' || ?)")
+        params.append(match_expr)
+    if year is not None:
+        conditions.append("f.year = ?")
+        params.append(year)
+    if company_query:
+        conditions.append("f.company_project LIKE ?")
+        params.append(f"%{company_query}%")
+    where_sql = " AND ".join(conditions)
+    params.append(limit)
+
     rows = conn.execute(
-        """
+        f"""
         SELECT f.id, f.name, f.path, f.company_project, f.year, f.location_site, f.source
-        FROM folders_fts
-        JOIN folders f ON f.id = folders_fts.rowid
-        WHERE folders_fts MATCH 'name: ' || ?
+        FROM folders f
+        WHERE {where_sql}
         LIMIT ?
         """,
-        (match_expr, limit),
+        params,
     ).fetchall()
     return [
         {

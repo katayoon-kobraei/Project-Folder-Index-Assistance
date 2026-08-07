@@ -20,6 +20,7 @@ sys.path.insert(0, str(BASE_DIR))
 
 import yaml  # noqa: E402
 
+from src.db.db import open_db  # noqa: E402
 from src.search.search import (  # noqa: E402
     get_location_graph,
     get_project_detail,
@@ -46,7 +47,28 @@ def _db_path() -> str:
     return db_path if Path(db_path).is_absolute() else str(BASE_DIR / db_path)
 
 
+_schema_ensured = False
+
+
+def _ensure_schema() -> None:
+    """Run schema.sql (via open_db) exactly ONCE per app run, so a
+    schema change — a new table, view, or index, like the year indexes
+    added for Buscar's filters — takes effect the moment the desktop app
+    opens the database, without waiting for the next full crawl to
+    (re)create it. Only once, not on every get_connection() call: every
+    statement in schema.sql is an idempotent CREATE ... IF NOT EXISTS,
+    but re-parsing and re-checking all of them still costs a few tens of
+    ms — negligible once at startup, but that adds up fast repeated on
+    every single search keystroke."""
+    global _schema_ensured
+    if _schema_ensured:
+        return
+    open_db(_db_path()).close()
+    _schema_ensured = True
+
+
 def get_connection() -> sqlite3.Connection:
+    _ensure_schema()
     return sqlite3.connect(_db_path())
 
 
@@ -65,25 +87,37 @@ def search(query: str = "") -> list[dict]:
         conn.close()
 
 
-def files(query: str = "", limit: int = 300) -> list[dict]:
-    """Full-text file-name search backing the file results in Buscar —
-    empty query returns nothing (there's no useful default order over
-    ~600k files)."""
+def files(
+    query: str = "",
+    limit: int = 300,
+    year: int | None = None,
+    company_query: str = "",
+) -> list[dict]:
+    """Full-text file-name search backing the file results in Buscar,
+    optionally narrowed by the same year/company filters as Proyectos.
+    Nothing is returned if query/year/company_query are all empty (no
+    useful default order over ~600k files)."""
     conn = get_connection()
     try:
-        return search_files(conn, query, limit)
+        return search_files(conn, query, limit, year, company_query)
     finally:
         conn.close()
 
 
-def folders(query: str = "", limit: int = 300) -> list[dict]:
+def folders(
+    query: str = "",
+    limit: int = 300,
+    year: int | None = None,
+    company_query: str = "",
+) -> list[dict]:
     """Full-text FOLDER-name search backing Buscar's top results — a
     folder's own name/address, not the resolved project's canonical
     name (see search_folders' docstring for why that distinction
-    matters). Empty query returns nothing."""
+    matters) — optionally narrowed by the same year/company filters as
+    Proyectos. Nothing is returned if all three are empty."""
     conn = get_connection()
     try:
-        return search_folders(conn, query, limit)
+        return search_folders(conn, query, limit, year, company_query)
     finally:
         conn.close()
 

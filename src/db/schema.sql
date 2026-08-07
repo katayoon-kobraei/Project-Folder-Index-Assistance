@@ -48,6 +48,16 @@ CREATE TABLE IF NOT EXISTS files (
                                             -- layer (see folders.location_site)
 );
 
+-- Speeds up an exact `year =` filter over ~89k folders / ~600k files —
+-- used by Buscar's year filter row and by list_all_projects()'s
+-- per-year EXISTS check. (Not indexing company_project: that filter is
+-- a substring LIKE '%...%' so a company name appearing anywhere, e.g.
+-- "DO PLENOIL" for a search of "PLENOIL", still matches — a plain
+-- B-tree index can't accelerate a leading-wildcard LIKE anyway, so
+-- there'd be nothing for it to speed up.)
+CREATE INDEX IF NOT EXISTS idx_folders_year ON folders(year);
+CREATE INDEX IF NOT EXISTS idx_files_file_year ON files(file_year);
+
 -- Resolved real-world projects, one row per project regardless of how many
 -- job codes it has across years. Built by src/resolution/match_projects.py.
 CREATE TABLE IF NOT EXISTS projects (
