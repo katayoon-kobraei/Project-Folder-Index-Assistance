@@ -473,6 +473,116 @@ def get_project_detail(conn, project_id: int):
     }
 
 
+def _glob_escape(path: str) -> str:
+    """Escape a literal path for safe use inside a GLOB pattern — GLOB
+    treats *, ?, and [ as wildcards, all of which show up in real folder
+    names in this archive (e.g. a folder literally named with brackets or
+    a question mark). Each gets wrapped in its own single-character
+    character class so it's matched literally."""
+    return path.replace("[", "[[]").replace("*", "[*]").replace("?", "[?]")
+
+
+_OFERTAS_SUBFOLDER_NAMES = {"facturacion", "ingevia"}
+
+
+def get_ofertas(conn, year: int | None = None, company_query: str = ""):
+    """OFERTAS page: every 'Firmado' or 'Pedido' document found inside a
+    'FACTURACION' or 'INGEVIA' subfolder (any case) that is a DIRECT
+    child of a '02.-GESTIÓN' folder — e.g.
+    '...\\02.-GESTIÓN\\FACTURACION\\...' or
+    '...\\02.-GESTIÓN\\INGEVIA\\...' — including everything nested any
+    number of levels further beneath that FACTURACION/INGEVIA folder
+    itself. Files that sit directly in '02.-GESTIÓN' or in some other
+    subfolder of it (e.g. 'Industria', 'AYTO') are deliberately excluded
+    — only these two specific subfolders count.
+
+    Firmado = filename ends in _signed.pdf / _f.pdf / _fda.pdf (any case).
+    Pedido  = filename starts with 'pedido' and ends in .pdf (any case).
+    A filename matching both (e.g. a signed pedido, 'PEDIDO ..._f.pdf')
+    is classified Firmado — the suffix is the more specific, final-state
+    signal.
+
+    Matching is done with plain Python string methods, not SQL LIKE:
+    LIKE's '_' is itself a single-character wildcard, so a naive
+    `LIKE '%_f.pdf'` silently over-matches (e.g. any 'Xf.pdf') — this
+    was caught during a spot check before at all.
+
+    Optionally narrowed by an exact `year` (the file's own file_year,
+    since a FACTURACION/INGEVIA folder's own subfolder could in principle
+    carry a different revision year) and/or a `company_query` substring
+    against company_project, same filter semantics as
+    search_files/search_folders. These are applied in Python AFTER the
+    path GLOB match, not folded into the same SQL WHERE clause —
+    combining a GLOB path-prefix filter with an indexed equality (year,
+    once idx_files_file_year exists) hit the exact same SQLite planner
+    pathology already worked around in search_files/search_folders: the
+    planner drove off the year index instead of the path index, turning a
+    fast query into hundreds of near-full table scans (measured 23.9s for
+    `year=2024` alone before this fix). The final result set here is at
+    most a couple thousand rows regardless, so filtering it in Python
+    after the (fast) GLOB pass costs nothing noticeable.
+
+    Returns a list of dicts sorted by year (most recent first), each with
+    path, name, company_project, location_site, year, and status."""
+    gestion_folders = conn.execute(
+        "SELECT path FROM folders WHERE name = '02.-GESTIÓN'"
+    ).fetchall()
+
+    target_paths = []
+    for (gestion_path,) in gestion_folders:
+        prefix = _glob_escape(gestion_path) + "\\*"
+        children = conn.execute(
+            "SELECT path, name FROM folders WHERE path GLOB ?", (prefix,)
+        ).fetchall()
+        prefix_len = len(gestion_path) + 1  # +1 for the separating backslash
+        for child_path, child_name in children:
+            # DIRECT child only: everything after the '02.-GESTIÓN\' prefix
+            # must be just this one folder's own name, no further '\' —
+            # a folder named FACTURACION nested two levels deeper doesn't
+            # count, only immediately under GESTIÓN.
+            if "\\" in child_path[prefix_len:]:
+                continue
+            if child_name.strip().lower() in _OFERTAS_SUBFOLDER_NAMES:
+                target_paths.append(child_path)
+
+    results = []
+    for folder_path in target_paths:
+        prefix = _glob_escape(folder_path) + "\\*"
+        rows = conn.execute(
+            """
+            SELECT path, name, company_project, location_site, file_year
+            FROM files
+            WHERE path GLOB ?
+            """,
+            (prefix,),
+        ).fetchall()
+        for path, name, company_project, location_site, file_year in rows:
+            if year is not None and file_year != year:
+                continue
+            if company_query and (not company_project or company_query.lower() not in company_project.lower()):
+                continue
+            low = name.lower()
+            if low.endswith("_signed.pdf") or low.endswith("_f.pdf") or low.endswith("_fda.pdf"):
+                status = "Firmado"
+            elif low.startswith("pedido") and low.endswith(".pdf"):
+                status = "Pedido"
+            else:
+                continue
+            results.append(
+                {
+                    "path": path,
+                    "name": name,
+                    "company_project": company_project,
+                    "location_site": location_site,
+                    "year": file_year,
+                    "status": status,
+                }
+            )
+
+    results.sort(key=lambda r: (r["year"] is not None, r["year"] or 0), reverse=True)
+    return results
+
+
 def list_locations(conn):
     """All detected locations, most-connected first."""
     rows = conn.execute(

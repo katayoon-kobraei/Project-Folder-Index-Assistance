@@ -23,6 +23,7 @@ import yaml  # noqa: E402
 from src.db.db import open_db  # noqa: E402
 from src.search.search import (  # noqa: E402
     get_location_graph,
+    get_ofertas,
     get_project_detail,
     get_project_location_graph,
     get_projects_location_graph,
@@ -118,6 +119,18 @@ def folders(
     conn = get_connection()
     try:
         return search_folders(conn, query, limit, year, company_query)
+    finally:
+        conn.close()
+
+
+def ofertas(year: int | None = None, company_query: str = "") -> list[dict]:
+    """Backs the OFERTAS page: every Firmado/Pedido document found inside
+    a '02.-GESTIÓN' folder tree (see get_ofertas' docstring for the
+    detection rules), optionally narrowed by the same year/company
+    filters as Buscar and Proyectos."""
+    conn = get_connection()
+    try:
+        return get_ofertas(conn, year, company_query)
     finally:
         conn.close()
 

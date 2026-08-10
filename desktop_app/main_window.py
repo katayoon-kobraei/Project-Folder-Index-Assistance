@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -73,6 +73,15 @@ STATUS_LABELS = {
 }
 SOURCE_LABELS = {"trabajos": "Trabajos", "ofertas": "Ofertas"}
 FILE_SEARCH_LIMIT = 300
+
+
+def containing_folder(path: str) -> str:
+    """The folder a file lives in, given its full path. Plain rsplit on
+    the Windows separator, not os.path.dirname — these paths are always
+    Windows-style ("P:\\...") regardless of what OS this app itself
+    happens to run on."""
+    idx = path.rfind("\\")
+    return path[:idx] if idx != -1 else path
 
 
 def configure_table(table: QTableWidget) -> None:
@@ -332,12 +341,18 @@ class SearchPage(QWidget):
         self.files_count_label.setObjectName("MutedText")
         outer.addWidget(self.files_count_label)
 
-        self.files_table = QTableWidget(0, 5)
+        self.files_table = QTableWidget(0, 6)
         self.files_table.setHorizontalHeaderLabels(
-            ["Archivo", "Proyecto", "Año", "Ubicación", "Carpeta"]
+            ["", "Archivo", "Proyecto", "Año", "Ubicación", "Carpeta"]
         )
         configure_table(self.files_table)
-        self._set_fixed_result_column_widths(self.files_table)
+        # Same fixed widths as the Carpetas table, shifted one column
+        # right to make room for the "open containing folder" button.
+        self.files_table.setColumnWidth(0, 40)
+        self.files_table.setColumnWidth(1, 260)
+        self.files_table.setColumnWidth(2, 200)
+        self.files_table.setColumnWidth(3, 60)
+        self.files_table.setColumnWidth(4, 160)
         # Carpeta (the file's containing path) needs to show in FULL too,
         # same reasoning as Ruta on the Carpetas table above — turn off
         # stretchLastSection so the column can grow past the window
@@ -443,15 +458,22 @@ class SearchPage(QWidget):
         self.files_table.setUpdatesEnabled(False)
         self.files_table.setRowCount(total)
         for row_idx, f in enumerate(self._file_rows):
-            self.files_table.setItem(row_idx, 0, QTableWidgetItem(f["name"]))
-            self.files_table.setItem(row_idx, 1, QTableWidgetItem(f.get("company_project") or ""))
-            self.files_table.setItem(row_idx, 2, QTableWidgetItem(str(f.get("file_year") or "?")))
-            self.files_table.setItem(row_idx, 3, QTableWidgetItem(f.get("location_site") or ""))
-            self.files_table.setItem(row_idx, 4, QTableWidgetItem(f["path"]))
+            open_button = QPushButton("📂")
+            open_button.setObjectName("LinkButton")
+            open_button.setCursor(Qt.PointingHandCursor)
+            open_button.setToolTip("Abrir la carpeta que contiene este archivo")
+            open_button.clicked.connect(lambda checked=False, i=row_idx: self._open_folder_for_file(i))
+            self.files_table.setCellWidget(row_idx, 0, open_button)
+
+            self.files_table.setItem(row_idx, 1, QTableWidgetItem(f["name"]))
+            self.files_table.setItem(row_idx, 2, QTableWidgetItem(f.get("company_project") or ""))
+            self.files_table.setItem(row_idx, 3, QTableWidgetItem(str(f.get("file_year") or "?")))
+            self.files_table.setItem(row_idx, 4, QTableWidgetItem(f.get("location_site") or ""))
+            self.files_table.setItem(row_idx, 5, QTableWidgetItem(f["path"]))
         # Only these two columns, same reasoning as the Carpetas table
         # above — cheap for a couple of columns, not for all five.
-        self.files_table.resizeColumnToContents(0)
-        self.files_table.resizeColumnToContents(4)
+        self.files_table.resizeColumnToContents(1)
+        self.files_table.resizeColumnToContents(5)
         self.files_table.setUpdatesEnabled(True)
 
     def refresh(self) -> None:
@@ -475,6 +497,175 @@ class SearchPage(QWidget):
         row = self.files_table.currentRow()
         if 0 <= row < len(self._file_rows):
             self._open_path(self._file_rows[row]["path"], "el archivo")
+
+    def _open_folder_for_file(self, row_idx: int) -> None:
+        if 0 <= row_idx < len(self._file_rows):
+            folder = containing_folder(self._file_rows[row_idx]["path"])
+            self._open_path(folder, "la carpeta")
+
+
+STATUS_COLORS = {"Firmado": "#0F6E56", "Pedido": "#B45309"}
+
+
+class OfertasPage(QWidget):
+    """Every 'Firmado' (contracts/certificates whose filename ends in
+    _signed/_f/_fda.pdf) or 'Pedido' (filename starts with 'pedido') PDF
+    found inside a FACTURACION or INGEVIA subfolder (any case) of a
+    '02.-GESTIÓN' folder — including everything nested further beneath
+    that subfolder, not just its own direct children (see get_ofertas'
+    docstring for why). Files elsewhere in '02.-GESTIÓN' don't count.
+    Same year/company filter row as Buscar; a single result table with
+    the full file path always shown, same treatment as Buscar's Ruta/
+    Carpeta columns."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(26, 22, 26, 26)
+        outer.setSpacing(14)
+
+        heading = QLabel("Ofertas: documentos Firmado y Pedido")
+        heading.setObjectName("SectionTitle")
+        outer.addWidget(heading)
+
+        subtitle = QLabel(
+            "Archivos dentro de una carpeta 'FACTURACION' o 'INGEVIA' que esté "
+            "directamente dentro de '02.-GESTIÓN' (y sus subcarpetas), con nombre "
+            "terminado en _signed/_f/_fda.pdf (Firmado) o que empieza por 'pedido' (Pedido)."
+        )
+        subtitle.setObjectName("MutedText")
+        subtitle.setWordWrap(True)
+        outer.addWidget(subtitle)
+
+        filters_row = QHBoxLayout()
+        filters_row.setSpacing(10)
+
+        filters_label = QLabel("Filtros:")
+        filters_label.setObjectName("MetricTitle")
+        filters_row.addWidget(filters_label)
+
+        self.year_filter = QComboBox()
+        self.year_filter.addItem("Todos los años", None)
+        self.year_filter.currentIndexChanged.connect(self._on_filters_changed)
+        filters_row.addWidget(self.year_filter)
+
+        self.company_filter = QLineEdit()
+        self.company_filter.setPlaceholderText("Filtrar por empresa/proyecto...")
+        self._debounce = QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(250)
+        self._debounce.timeout.connect(self._run_query)
+        self.company_filter.textChanged.connect(lambda _text: self._debounce.start())
+        filters_row.addWidget(self.company_filter, 1)
+
+        outer.addLayout(filters_row)
+
+        self._years_loaded = False
+        self._load_years()
+
+        self.count_label = QLabel("")
+        self.count_label.setObjectName("MutedText")
+        outer.addWidget(self.count_label)
+
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(
+            ["", "Estado", "Proyecto", "Año", "Ubicación", "Ruta"]
+        )
+        configure_table(self.table)
+        self.table.setColumnWidth(0, 40)
+        self.table.setColumnWidth(1, 90)
+        self.table.setColumnWidth(2, 220)
+        self.table.setColumnWidth(3, 60)
+        self.table.setColumnWidth(4, 180)
+        # Ruta shown in full, same reasoning as Buscar's Ruta/Carpeta
+        # columns — turn off stretchLastSection so it can grow past the
+        # window edge, with the table's own scrollbar taking over.
+        self.table.horizontalHeader().setStretchLastSection(False)
+        self.table.doubleClicked.connect(self._open_selected_file)
+        outer.addWidget(self.table, 1)
+
+        self._rows: list[dict] = []
+
+    def _load_years(self) -> None:
+        if self._years_loaded:
+            return
+        try:
+            years = data_service.available_years()
+        except Exception:
+            years = []
+        for year in years:
+            self.year_filter.addItem(str(year), year)
+        self._years_loaded = True
+
+    def _on_filters_changed(self) -> None:
+        self._run_query()
+
+    def _run_query(self) -> None:
+        year = self.year_filter.currentData()
+        company_query = self.company_filter.text().strip()
+        try:
+            self._rows = data_service.ofertas(year, company_query)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error al cargar ofertas", str(exc))
+            self._rows = []
+        self._render()
+
+    def _render(self) -> None:
+        total = len(self._rows)
+        firmado = sum(1 for r in self._rows if r.get("status") == "Firmado")
+        pedido = total - firmado
+        self.count_label.setText(f"{total} documento(s) — {firmado} Firmado, {pedido} Pedido")
+
+        self.table.setUpdatesEnabled(False)
+        self.table.setRowCount(total)
+        for row_idx, r in enumerate(self._rows):
+            open_button = QPushButton("📂")
+            open_button.setObjectName("LinkButton")
+            open_button.setCursor(Qt.PointingHandCursor)
+            open_button.setToolTip("Abrir la carpeta que contiene este archivo")
+            open_button.clicked.connect(lambda checked=False, i=row_idx: self._open_folder(i))
+            self.table.setCellWidget(row_idx, 0, open_button)
+
+            status = r.get("status") or ""
+            status_item = QTableWidgetItem(status)
+            color = STATUS_COLORS.get(status)
+            if color:
+                status_item.setForeground(QColor(color))
+            self.table.setItem(row_idx, 1, status_item)
+            self.table.setItem(row_idx, 2, QTableWidgetItem(r.get("company_project") or ""))
+            self.table.setItem(row_idx, 3, QTableWidgetItem(str(r.get("year") or "?")))
+            self.table.setItem(row_idx, 4, QTableWidgetItem(r.get("location_site") or ""))
+            self.table.setItem(row_idx, 5, QTableWidgetItem(r["path"]))
+        # Only the Ruta column, same cheap-resize reasoning used
+        # throughout the rest of the app.
+        self.table.resizeColumnToContents(5)
+        self.table.setUpdatesEnabled(True)
+
+    def refresh(self) -> None:
+        self._load_years()
+        self._run_query()
+
+    def _open_selected_file(self, _index) -> None:
+        row = self.table.currentRow()
+        if 0 <= row < len(self._rows):
+            path = self._rows[row]["path"]
+            if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+                QMessageBox.warning(
+                    self,
+                    "No se pudo abrir el archivo",
+                    f"No se pudo abrir:\n{path}\n\n¿Sigue existiendo en esa ubicación?",
+                )
+
+    def _open_folder(self, row_idx: int) -> None:
+        if not (0 <= row_idx < len(self._rows)):
+            return
+        folder = containing_folder(self._rows[row_idx]["path"])
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(folder)):
+            QMessageBox.warning(
+                self,
+                "No se pudo abrir la carpeta",
+                f"No se pudo abrir:\n{folder}\n\n¿Sigue existiendo en esa ubicación?",
+            )
 
 
 class TimelineWidget(QWidget):
@@ -772,10 +963,12 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.projects_page = ProjectsPage()
         self.search_page = SearchPage()
+        self.ofertas_page = OfertasPage()
         self.project_page = ProjectDetailPage()
         for page in (
             self.projects_page,
             self.search_page,
+            self.ofertas_page,
             self.project_page,
         ):
             self.stack.addWidget(page)
@@ -821,6 +1014,7 @@ class MainWindow(QMainWindow):
         buttons = [
             ("▦  Proyectos", 0),
             ("🔍  Buscar", 1),
+            ("📄  Ofertas", 2),
         ]
         for text, index in buttons:
             button = QPushButton(text)
@@ -869,7 +1063,8 @@ class MainWindow(QMainWindow):
     _PAGE_TITLES = {
         0: ("Proyectos", "Lista completa de proyectos — filtra por año o por nombre"),
         1: ("Buscar", "Buscar por nombre de carpeta, dirección o archivo"),
-        2: ("Proyecto", ""),
+        2: ("Ofertas", "Documentos Firmado y Pedido dentro de FACTURACION/INGEVIA en 02.-GESTIÓN"),
+        3: ("Proyecto", ""),
     }
 
     def _navigate(self, index: int) -> None:
@@ -877,22 +1072,25 @@ class MainWindow(QMainWindow):
         title, subtitle = self._PAGE_TITLES[index]
         self.top_title.setText(title)
         self.top_subtitle.setText(subtitle)
-        for button, button_index in zip(self.nav_buttons, (0, 1)):
+        for button, button_index in zip(self.nav_buttons, (0, 1, 2)):
             button.setChecked(button_index == index)
         if index == 0:
             self.projects_page.refresh()
+        elif index == 2:
+            self.ofertas_page.refresh()
 
     def open_project(self, project_id: int) -> None:
         # Remember which page this was opened from, BEFORE switching away
         # from it, so the project page's back button returns there.
         self._project_return_index = self.stack.currentIndex()
         self.project_page.load(project_id)
-        self._navigate(2)
+        self._navigate(3)
 
     def refresh_all(self) -> None:
         try:
             self.projects_page.refresh()
             self.search_page.refresh()
+            self.ofertas_page.refresh()
             self.statusBar().showMessage("Datos actualizados", 4000)
         except Exception as exc:
             self.statusBar().showMessage("No se pudieron cargar los datos", 4000)

@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.db.db import open_db, rebuild_fts
 from src.search.search import (
     get_location_graph,
+    get_ofertas,
     get_project_detail,
     get_project_location_graph,
     get_projects_location_graph,
@@ -559,6 +560,200 @@ def test_get_projects_location_graph_year_filter_flips_which_project_is_current(
     nodes = {el["data"]["id"]: el["data"] for el in graph["elements"] if "source" not in el["data"]}
     assert nodes[f"project-{consum_id}"]["is_current"] is False
     assert nodes[f"project-{other_id}"]["is_current"] is True
+
+    conn.close()
+
+
+def _make_gestion_folder(conn, base: str, **extra) -> tuple[int, str]:
+    """Insert a '02.-GESTIÓN' folder at base + '\\02.-GESTIÓN' and return
+    (its id, its full path), using the same Windows-style backslash paths
+    the real P: archive uses (the recursive subfolder match in
+    get_ofertas is path-prefix based, so this matters — a test file's own
+    `path` must actually start with the folder's real path, not a
+    placeholder)."""
+    path = base + "\\02.-GESTIÓN"
+    _insert_folder(conn, path, "02.-GESTIÓN", **extra)
+    fid = conn.execute("SELECT id FROM folders WHERE path = ?", (path,)).fetchone()[0]
+    return fid, path
+
+
+def _make_target_subfolder(conn, gestion_path: str, subfolder_name: str, **extra) -> tuple[int, str]:
+    """Insert a FACTURACION/INGEVIA-style folder as a DIRECT child of an
+    existing '02.-GESTIÓN' folder and return (its id, its full path) —
+    only files under one of these two specific subfolders should ever
+    make it into get_ofertas' results."""
+    path = gestion_path + "\\" + subfolder_name
+    _insert_folder(conn, path, subfolder_name, **extra)
+    fid = conn.execute("SELECT id FROM folders WHERE path = ?", (path,)).fetchone()[0]
+    return fid, path
+
+
+def test_get_ofertas_finds_signed_and_pedido_in_facturacion_and_ingevia(tmp_path):
+    conn = open_db(str(tmp_path / "index.db"))
+    _fid, gestion_path = _make_gestion_folder(conn, "P:\\TRABAJOS 2024\\24-001 PLENOIL", company_project="PLENOIL", year=2024)
+    fact_fid, fact_path = _make_target_subfolder(conn, gestion_path, "FACTURACION")
+    ing_fid, ing_path = _make_target_subfolder(conn, gestion_path, "INGEVIA")
+    _insert_file(conn, fact_fid, fact_path + "\\Contrato_Signed.pdf", "Contrato_Signed.pdf", file_year=2024, company_project="PLENOIL")
+    _insert_file(conn, fact_fid, fact_path + "\\Presupuesto.pdf", "Presupuesto.pdf", file_year=2024, company_project="PLENOIL")
+    _insert_file(conn, ing_fid, ing_path + "\\Pedido 0001.pdf", "Pedido 0001.pdf", file_year=2024, company_project="PLENOIL")
+    conn.commit()
+
+    results = get_ofertas(conn)
+    by_name = {r["name"]: r for r in results}
+    assert set(by_name) == {"Contrato_Signed.pdf", "Pedido 0001.pdf"}
+    assert by_name["Contrato_Signed.pdf"]["status"] == "Firmado"
+    assert by_name["Pedido 0001.pdf"]["status"] == "Pedido"
+    assert by_name["Contrato_Signed.pdf"]["company_project"] == "PLENOIL"
+    assert by_name["Contrato_Signed.pdf"]["year"] == 2024
+
+    conn.close()
+
+
+def test_get_ofertas_requires_facturacion_or_ingevia_subfolder(tmp_path):
+    # A signed/pedido file directly inside '02.-GESTIÓN' itself, or
+    # inside some OTHER subfolder of it (e.g. 'Industria'), must NOT
+    # appear — only FACTURACION/INGEVIA count.
+    conn = open_db(str(tmp_path / "index.db"))
+    fid, gestion_path = _make_gestion_folder(conn, "P:\\TRABAJOS 2016\\16-051 OIL HORTA", company_project="OIL HORTA", year=2016)
+    _insert_file(conn, fid, gestion_path + "\\Direct_F.pdf", "Direct_F.pdf", file_year=2016, company_project="OIL HORTA")
+    other_fid, other_path = _make_target_subfolder(conn, gestion_path, "Industria")
+    _insert_file(conn, other_fid, other_path + "\\Boletin_F.pdf", "Boletin_F.pdf", file_year=2016, company_project="OIL HORTA")
+    conn.commit()
+
+    assert get_ofertas(conn) == []
+
+    conn.close()
+
+
+def test_get_ofertas_subfolder_name_is_case_insensitive(tmp_path):
+    conn = open_db(str(tmp_path / "index.db"))
+    _fid, gestion_path = _make_gestion_folder(conn, "P:\\TRABAJOS 2020\\20-001 A")
+    fact_fid, fact_path = _make_target_subfolder(conn, gestion_path, "Facturacion")
+    ing_fid, ing_path = _make_target_subfolder(conn, gestion_path, "ingevia")
+    _insert_file(conn, fact_fid, fact_path + "\\a_f.pdf", "a_f.pdf")
+    _insert_file(conn, ing_fid, ing_path + "\\Pedido b.pdf", "Pedido b.pdf")
+    conn.commit()
+
+    names = {r["name"] for r in get_ofertas(conn)}
+    assert names == {"a_f.pdf", "Pedido b.pdf"}
+
+    conn.close()
+
+
+def test_get_ofertas_recurses_into_subfolders_of_facturacion_and_ingevia(tmp_path):
+    # Real signed certificates in the archive routinely sit a level or
+    # two deeper than the FACTURACION/INGEVIA folder itself — get_ofertas
+    # must find these too, not just direct children of that folder.
+    conn = open_db(str(tmp_path / "index.db"))
+    _fid, gestion_path = _make_gestion_folder(conn, "P:\\TRABAJOS 2016\\16-051 OIL HORTA", company_project="OIL HORTA", year=2016)
+    _ing_fid, ing_path = _make_target_subfolder(conn, gestion_path, "INGEVIA", company_project="OIL HORTA", year=2016)
+    _insert_folder(conn, ing_path + "\\OFERTA 018.2024", "OFERTA 018.2024", company_project="OIL HORTA", year=2016)
+    sub_fid = conn.execute(
+        "SELECT id FROM folders WHERE path = ?", (ing_path + "\\OFERTA 018.2024",)
+    ).fetchone()[0]
+    _insert_file(
+        conn, sub_fid, ing_path + "\\OFERTA 018.2024\\Boletin_F.pdf",
+        "Boletin_F.pdf", file_year=2016, company_project="OIL HORTA",
+    )
+    conn.commit()
+
+    results = get_ofertas(conn)
+    assert [r["name"] for r in results] == ["Boletin_F.pdf"]
+    assert results[0]["status"] == "Firmado"
+
+    conn.close()
+
+
+def test_get_ofertas_case_insensitive_suffix_and_prefix_variants(tmp_path):
+    conn = open_db(str(tmp_path / "index.db"))
+    _fid, gestion_path = _make_gestion_folder(conn, "P:\\TRABAJOS 2020\\20-001 CONSUM")
+    fact_fid, path = _make_target_subfolder(conn, gestion_path, "FACTURACION")
+    names = [
+        "a_signed.pdf", "b_f.pdf", "c_F.pdf", "d_Fda.pdf", "e_fda.pdf",
+        "PEDIDO uno.pdf", "Pedido dos.pdf", "pedido tres.pdf",
+    ]
+    for name in names:
+        _insert_file(conn, fact_fid, f"{path}\\{name}", name)
+    conn.commit()
+
+    results = get_ofertas(conn)
+    statuses = {r["name"]: r["status"] for r in results}
+    assert statuses == {
+        "a_signed.pdf": "Firmado", "b_f.pdf": "Firmado", "c_F.pdf": "Firmado",
+        "d_Fda.pdf": "Firmado", "e_fda.pdf": "Firmado",
+        "PEDIDO uno.pdf": "Pedido", "Pedido dos.pdf": "Pedido", "pedido tres.pdf": "Pedido",
+    }
+
+    conn.close()
+
+
+def test_get_ofertas_does_not_treat_underscore_as_a_wildcard(tmp_path):
+    # A naive `LIKE '%_f.pdf'` in SQL would also match "XXf.pdf" (LIKE's
+    # '_' matches any single character) — get_ofertas must only match a
+    # real, literal "_f.pdf"/"_signed.pdf"/"_fda.pdf" suffix.
+    conn = open_db(str(tmp_path / "index.db"))
+    _fid, gestion_path = _make_gestion_folder(conn, "P:\\TRABAJOS 2021\\21-001 X")
+    fact_fid, path = _make_target_subfolder(conn, gestion_path, "FACTURACION")
+    _insert_file(conn, fact_fid, path + "\\ReportXf.pdf", "ReportXf.pdf")
+    _insert_file(conn, fact_fid, path + "\\Real_f.pdf", "Real_f.pdf")
+    conn.commit()
+
+    results = get_ofertas(conn)
+    assert [r["name"] for r in results] == ["Real_f.pdf"]
+
+    conn.close()
+
+
+def test_get_ofertas_signed_pedido_file_counts_as_firmado(tmp_path):
+    # A pedido document that has also been signed (e.g.
+    # "PEDIDO 42-3041 OFERTA 18-2022 PLANTA 4_f.pdf" — a real filename
+    # found in the archive) matches both patterns; Firmado wins since the
+    # suffix is the more specific, final-state signal.
+    conn = open_db(str(tmp_path / "index.db"))
+    _fid, gestion_path = _make_gestion_folder(conn, "P:\\TRABAJOS 2021\\21-021 PLASTIC7A")
+    ing_fid, path = _make_target_subfolder(conn, gestion_path, "INGEVIA")
+    _insert_file(conn, ing_fid, path + "\\PEDIDO 42-3041 OFERTA 18-2022_f.pdf", "PEDIDO 42-3041 OFERTA 18-2022_f.pdf")
+    conn.commit()
+
+    results = get_ofertas(conn)
+    assert len(results) == 1
+    assert results[0]["status"] == "Firmado"
+
+    conn.close()
+
+
+def test_get_ofertas_ignores_files_outside_gestion_folders(tmp_path):
+    conn = open_db(str(tmp_path / "index.db"))
+    _insert_folder(conn, "P:\\TRABAJOS 2020\\20-002 OTRA\\00.-PLANOS", "00.-PLANOS")
+    other_fid = conn.execute(
+        "SELECT id FROM folders WHERE path = ?", ("P:\\TRABAJOS 2020\\20-002 OTRA\\00.-PLANOS",)
+    ).fetchone()[0]
+    _insert_file(conn, other_fid, "P:\\...\\Plano_Signed.pdf", "Plano_Signed.pdf")
+    conn.commit()
+
+    assert get_ofertas(conn) == []
+
+    conn.close()
+
+
+def test_get_ofertas_year_and_company_filters(tmp_path):
+    conn = open_db(str(tmp_path / "index.db"))
+    _fid_2025, gestion_2025 = _make_gestion_folder(conn, "P:\\TRABAJOS 2025\\25-001 PLENOIL")
+    _fid_2019, gestion_2019 = _make_gestion_folder(conn, "P:\\TRABAJOS 2019\\19-001 CONSUM")
+    fact_2025_fid, path_2025 = _make_target_subfolder(conn, gestion_2025, "FACTURACION")
+    fact_2019_fid, path_2019 = _make_target_subfolder(conn, gestion_2019, "FACTURACION")
+    _insert_file(conn, fact_2025_fid, path_2025 + "\\Contrato_F.pdf", "Contrato_F.pdf", file_year=2025, company_project="PLENOIL")
+    _insert_file(conn, fact_2019_fid, path_2019 + "\\Contrato2_F.pdf", "Contrato2_F.pdf", file_year=2019, company_project="CONSUM")
+    conn.commit()
+
+    results = get_ofertas(conn, year=2025)
+    assert [r["name"] for r in results] == ["Contrato_F.pdf"]
+
+    results = get_ofertas(conn, company_query="CONSUM")
+    assert [r["name"] for r in results] == ["Contrato2_F.pdf"]
+
+    results = get_ofertas(conn, year=2025, company_query="CONSUM")
+    assert results == []
 
     conn.close()
 
