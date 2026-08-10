@@ -34,13 +34,21 @@ from src.search.search import (  # noqa: E402
     search_folders,
     search_projects,
 )
+from src.project_info.reader import YEARS_WITH_DATA, load_project_info  # noqa: E402
 from src.webapp import pipeline  # noqa: E402
 
 CONFIG_PATH = BASE_DIR / "config" / "config.yaml"
 
 
 def load_config() -> dict:
-    return yaml.safe_load(CONFIG_PATH.read_text())
+    # encoding="utf-8" explicitly — without it, Python falls back to the
+    # OS's locale-preferred encoding, which on Windows is often NOT
+    # UTF-8 (commonly cp1252). config.yaml itself is saved as UTF-8 (it
+    # has accented Spanish text like "AÑOS" in it), so reading it with
+    # the wrong encoding silently mangled every accented character
+    # instead of raising an error — "AÑOS" came back as "AÃ'OS", which
+    # then obviously didn't match any real file on disk.
+    return yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 
 
 def _db_path() -> str:
@@ -133,6 +141,65 @@ def ofertas(year: int | None = None, company_query: str = "") -> list[dict]:
         return get_ofertas(conn, year, company_query)
     finally:
         conn.close()
+
+
+def _project_info_dir() -> str:
+    path = load_config().get("project_info_dir")
+    if not path:
+        raise FileNotFoundError(
+            "No se ha configurado 'project_info_dir' en config/config.yaml."
+        )
+    return path if Path(path).is_absolute() else str(BASE_DIR / path)
+
+
+_project_info_cache: dict = {"dir": None, "signature": None, "rows": None}
+
+
+def _project_info_signature(dir_path: str) -> tuple:
+    """One (filename, mtime) pair per year file that actually exists in
+    dir_path, in a fixed order — used to detect whether ANY of the
+    2024/2025/2026 files has changed (or appeared/disappeared) since the
+    last read, without caring which specific one."""
+    signature = []
+    for year_str in YEARS_WITH_DATA:
+        file_path = Path(dir_path) / f"{year_str}.xlsx"
+        if file_path.exists():
+            signature.append((year_str, file_path.stat().st_mtime))
+    return tuple(signature)
+
+
+def project_info_rows() -> list[dict]:
+    """Every project row from the per-year workbook files inside
+    project_info_dir (see src/project_info/reader.py for the column
+    mapping, the 2024/2025/2026-only scope, and why per-year files
+    instead of the single master workbook), backing the Proyectos Info
+    page. Cached by directory + a signature of each year file's modified
+    time, so opening the page repeatedly doesn't re-parse ~1,300 rows on
+    every click — only when at least one of the year files has actually
+    changed since the last read, or on the very first call. Raises
+    FileNotFoundError (with a message meant to be shown directly to the
+    user) if project_info_dir isn't set, doesn't exist, or has none of
+    the three expected year files."""
+    dir_path = _project_info_dir()
+    signature = _project_info_signature(dir_path)
+    if not signature:
+        raise FileNotFoundError(
+            f"No se encontró ningún archivo de año (2024.xlsx, 2025.xlsx, 2026.xlsx) en: {dir_path}\n"
+            "Revisa 'project_info_dir' en config/config.yaml, o genera esos archivos con "
+            "scripts/split_project_info_by_year.py."
+        )
+    if _project_info_cache["dir"] != dir_path or _project_info_cache["signature"] != signature:
+        _project_info_cache["rows"] = load_project_info(dir_path)
+        _project_info_cache["dir"] = dir_path
+        _project_info_cache["signature"] = signature
+    return _project_info_cache["rows"]
+
+
+def project_info_detail(item_id: int) -> dict | None:
+    for row in project_info_rows():
+        if row["id"] == item_id:
+            return row
+    return None
 
 
 def all_projects(name_query: str = "", year: int | None = None) -> list[dict]:

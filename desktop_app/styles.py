@@ -295,6 +295,27 @@ QHeaderView::section {
 QTableWidget::item { padding: 7px; }
 QTableWidget::item:hover { background: #f0f9f6; }
 
+/* Tree (Proyectos Info hierarchy) — without this, QTreeWidget falls back
+   to the OS's own theme instead of this stylesheet's colors, which on a
+   system with Windows dark mode on means a near-black background with
+   the app's dark navy text on top of it: unreadable. Same white/teal
+   language as QTableWidget above, just for the tree instead. */
+QTreeWidget {
+    background: white;
+    border: 1px solid #e0e7ef;
+    border-radius: 11px;
+    alternate-background-color: #f8fbff;
+    selection-background-color: #d7f0e6;
+    selection-color: #102a43;
+    outline: none;
+}
+QTreeWidget::item {
+    padding: 6px;
+    border: none;
+}
+QTreeWidget::item:hover { background: #f0f9f6; }
+QTreeWidget::branch { background: white; }
+
 /* Progress and scrollbars */
 QProgressBar {
     background: #dbe7f2;

@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QComboBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -46,6 +47,8 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QTableWidget,
     QTableWidgetItem,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -668,6 +671,290 @@ class OfertasPage(QWidget):
             )
 
 
+PROJECT_INFO_FIELDS = [
+    # (Spanish label shown on the detail card, key in the dict returned
+    # by data_service.project_info_detail). Every field the source
+    # workbook has, in a sensible reading order — a field simply doesn't
+    # appear on the card at all for a project/row where it's blank (see
+    # ProyectosInfoDetailPage.load()), so listing all of them here costs
+    # nothing when most rows only have a handful filled in.
+    ("Cliente", "client"),
+    ("Ubicación", "location"),
+    ("Año", "year"),
+    ("Empleados asignados actualmente", "employees_assigned"),
+    ("Fecha del proyecto", "start_date"),
+    ("Comienzo de la obra", "work_start_date"),
+    ("Fecha límite (fin de la obra)", "deadline"),
+    ("Categoría de tipo de trabajo", "work_type"),
+    ("Categoría de tipo de proyecto", "project_type"),
+    ("Número de proyecto", "project_number"),
+    ("Trabajos a realizar", "work_description"),
+    ("Título completo", "full_title"),
+    ("Presupuesto (ejecución material)", "budget_execution"),
+    ("Presupuesto de las obras", "budget_works"),
+    ("Importe del contrato", "contract_amount"),
+    ("m² suelo desarrollado", "m2_suelo"),
+    ("m² urbanizado / edificabilidad", "m2_urbanizado"),
+    ("Firmado", "signed"),
+    ("Fecha de la firma", "signed_date"),
+    ("Visado", "visa"),
+    ("Número de expediente", "file_number"),
+    ("Fecha del visado", "visa_date"),
+    ("Certificado de solvencia", "solvency_certificate"),
+    ("Administración contratante", "contracting_admin"),
+    ("Asistencia técnica", "technical_assistance"),
+    ("Copias impresas / CD", "copies"),
+    ("Web 1", "web1"),
+    ("Web 2 (comunicación online)", "web2"),
+    ("KPI concurso", "kpi_concurso"),
+    ("KPI m² desarrollados", "kpi_m2"),
+    ("KPI dirección de obra", "kpi_do"),
+    ("Cert. repr. BI", "cert_repr_bi"),
+    ("Cert. repr. IVA", "cert_repr_iva"),
+    ("Cert. repr. totales", "cert_repr_totales"),
+    ("Notas", "notes"),
+]
+
+# Colored pill for the PLANNING column — shown as a badge next to each
+# project (in the list AND on its detail page), not as a plain text row
+# among the other fields, since it's the one status every single project
+# in the 2024-2026 data actually has filled in (confirmed by hand).
+_PLANNING_PILL_STYLES = {
+    "Acabado": "SuccessPill",
+    "Cancelado": "ErrorPill",
+    "Proceso": "WarningPill",
+    "DO": "NeutralPill",
+}
+
+
+def _planning_pill_style(status: str | None) -> str:
+    return _PLANNING_PILL_STYLES.get((status or "").strip(), "NeutralPill")
+
+
+def _make_status_pill(status: str | None) -> QLabel:
+    # About 105 of the 366 2024-2026 rows actually have NO PLANNING
+    # value (mostly the "request received, not catalogued yet" first
+    # row for a project — see reader.py's docstring for a real example)
+    # — shown as a neutral "Sin estado" pill rather than a blank gap, so
+    # every row in the list looks consistent either way.
+    pill = QLabel(status or "Sin estado")
+    pill.setObjectName(_planning_pill_style(status) if status else "NeutralPill")
+    pill.setAlignment(Qt.AlignCenter)
+    return pill
+
+
+class ProyectosInfoPage(QWidget):
+    """Year -> project hierarchy read from the hand-maintained 'LISTADO
+    PROYECTOS POR AÑOS' workbook (project_info_path in config.yaml) — a
+    completely separate data source from the crawled P: index the rest
+    of the app uses. Only 2024, 2025, and 2026 currently have real data
+    in that file (see src/project_info/reader.py), so those are the only
+    years that can ever appear here. The list shows each project's raw
+    NOMBRE value exactly as it reads in the workbook (no derived company
+    prefix), plus its PLANNING status as a small colored pill (every
+    2024-2026 row has this filled in) — clicking a row opens its own
+    detail card (ProyectosInfoDetailPage), not a table."""
+
+    project_info_opened = Signal(int)
+
+    def __init__(self) -> None:
+        super().__init__()
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(26, 22, 26, 26)
+        outer.setSpacing(14)
+
+        heading = QLabel("Proyectos Info")
+        heading.setObjectName("SectionTitle")
+        outer.addWidget(heading)
+
+        subtitle = QLabel(
+            "Datos del archivo Excel de proyectos (2024, 2025 y 2026 — únicos años "
+            "con datos disponibles). Haz doble clic en un proyecto para ver su ficha."
+        )
+        subtitle.setObjectName("MutedText")
+        subtitle.setWordWrap(True)
+        outer.addWidget(subtitle)
+
+        self.filter_box = QLineEdit()
+        self.filter_box.setPlaceholderText("Filtrar por nombre de proyecto...")
+        self.filter_box.textChanged.connect(self._render)
+        outer.addWidget(self.filter_box)
+
+        self.count_label = QLabel("")
+        self.count_label.setObjectName("MutedText")
+        outer.addWidget(self.count_label)
+
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(2)
+        self.tree.setHeaderLabels(["Proyecto", "Estado"])
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setRootIsDecorated(True)
+        # Full NOMBRE value, not truncated to the visible width — same
+        # idea as Ruta/Carpeta elsewhere in the app: let the column grow
+        # past the window edge and rely on the tree's own scrollbar. The
+        # Estado column stays a small fixed width for its colored pill.
+        self.tree.header().setStretchLastSection(False)
+        self.tree.setColumnWidth(1, 110)
+        self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+        outer.addWidget(self.tree, 1)
+
+        self._rows: list[dict] = []
+        self._error: str | None = None
+
+    def refresh(self) -> None:
+        try:
+            self._rows = data_service.project_info_rows()
+            self._error = None
+        except Exception as exc:
+            self._rows = []
+            self._error = str(exc)
+        self._render()
+
+    def _render(self) -> None:
+        self.tree.setUpdatesEnabled(False)
+        self.tree.clear()
+
+        if self._error:
+            self.count_label.setText(self._error)
+            self.tree.setUpdatesEnabled(True)
+            return
+
+        filter_text = self.filter_box.text().strip().lower()
+        by_year: dict[int, list[dict]] = {}
+        for row in self._rows:
+            if filter_text and filter_text not in (row["project_name"] or "").lower():
+                continue
+            by_year.setdefault(row["year"], []).append(row)
+
+        total = sum(len(rows) for rows in by_year.values())
+        self.count_label.setText(f"{total} proyecto(s)")
+
+        for year in sorted(by_year.keys(), reverse=True):
+            year_item = QTreeWidgetItem([str(year)])
+            bold_font = year_item.font(0)
+            bold_font.setBold(True)
+            year_item.setFont(0, bold_font)
+            self.tree.addTopLevelItem(year_item)
+            # NOT re-sorted — kept in the same order the rows appear in
+            # the source spreadsheet (by_year[year] is already in that
+            # order, since reader.py appends rows as it reads them and
+            # never sorts). The sheet's own order is meaningful: several
+            # rows can share one project name, each representing a
+            # different document/task for it, in a specific sequence.
+            for row in by_year[year]:
+                child = QTreeWidgetItem([row["project_name"] or ""])
+                child.setData(0, Qt.UserRole, row["id"])
+                year_item.addChild(child)
+                self.tree.setItemWidget(child, 1, _make_status_pill(row.get("status")))
+            year_item.setExpanded(True)
+
+        self.tree.resizeColumnToContents(0)
+        self.tree.setUpdatesEnabled(True)
+
+    def _on_item_double_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
+        item_id = item.data(0, Qt.UserRole)
+        if item_id is not None:
+            self.project_info_opened.emit(item_id)
+
+
+class ProyectosInfoDetailPage(QWidget):
+    """Card-style detail view for one row from the project info workbook
+    — a label/value grid, not a table. Only fields that actually have a
+    value in the workbook are shown; a field that's blank for this
+    particular project (e.g. most rows have no TIPO, and NONE currently
+    have Empleados/Fecha límite — see reader.py's module docstring) is
+    left out of the card entirely rather than shown as empty, per the
+    explicit request. The card is rebuilt from scratch on every load()
+    since which fields are present varies row to row."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(26, 22, 26, 26)
+        outer.setSpacing(14)
+
+        self.back_button = QPushButton("←  Volver")
+        self.back_button.setObjectName("LinkButton")
+        self.back_button.setCursor(Qt.PointingHandCursor)
+        outer.addWidget(self.back_button, alignment=Qt.AlignLeft)
+
+        self.title_label = QLabel("")
+        self.title_label.setObjectName("PageTitle")
+        self.title_label.setWordWrap(True)
+        outer.addWidget(self.title_label)
+
+        self.status_pill = QLabel("")
+        self.status_pill.setVisible(False)
+        outer.addWidget(self.status_pill, alignment=Qt.AlignLeft)
+
+        self.empty_label = QLabel("Este proyecto no tiene ningún otro dato en el archivo.")
+        self.empty_label.setObjectName("MutedText")
+        self.empty_label.setVisible(False)
+        outer.addWidget(self.empty_label)
+
+        self.card = QFrame()
+        self.card.setObjectName("Panel")
+        self.card_layout = QGridLayout(self.card)
+        self.card_layout.setContentsMargins(22, 20, 22, 20)
+        self.card_layout.setHorizontalSpacing(18)
+        self.card_layout.setVerticalSpacing(14)
+        self.card_layout.setColumnStretch(1, 1)
+        outer.addWidget(self.card)
+        outer.addStretch()
+
+        self._item_id: int | None = None
+
+    def _clear_card(self) -> None:
+        while self.card_layout.count():
+            item = self.card_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+    def load(self, item_id: int) -> None:
+        self._item_id = item_id
+        try:
+            data = data_service.project_info_detail(item_id)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error al cargar la información", str(exc))
+            return
+        if data is None:
+            QMessageBox.warning(
+                self, "No encontrado", "Este proyecto ya no está en el archivo de datos."
+            )
+            return
+
+        self.title_label.setText(data.get("project_name") or "(Sin nombre)")
+
+        status = data.get("status")
+        self.status_pill.setVisible(True)
+        self.status_pill.setText(status or "Sin estado")
+        self.status_pill.setObjectName(_planning_pill_style(status) if status else "NeutralPill")
+        # Re-polishing is required after changing objectName on an
+        # already-shown widget — Qt only applies a stylesheet rule keyed
+        # by object name once, at the widget's first polish.
+        self.status_pill.style().unpolish(self.status_pill)
+        self.status_pill.style().polish(self.status_pill)
+
+        self._clear_card()
+        row_idx = 0
+        for label_text, key in PROJECT_INFO_FIELDS:
+            value = data.get(key)
+            if value in (None, ""):
+                continue
+            label = QLabel(label_text + ":")
+            label.setObjectName("MetricTitle")
+            label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+            value_label = QLabel(str(value))
+            value_label.setWordWrap(True)
+            self.card_layout.addWidget(label, row_idx, 0)
+            self.card_layout.addWidget(value_label, row_idx, 1)
+            row_idx += 1
+
+        self.card.setVisible(row_idx > 0)
+        self.empty_label.setVisible(row_idx == 0)
+
+
 class TimelineWidget(QWidget):
     """Small custom-drawn year-by-year timeline: one column per year, a
     colored dot per linked folder that year (teal for the main phase,
@@ -962,14 +1249,18 @@ class MainWindow(QMainWindow):
 
         self.stack = QStackedWidget()
         self.projects_page = ProjectsPage()
+        self.proyectos_info_page = ProyectosInfoPage()
         self.search_page = SearchPage()
         self.ofertas_page = OfertasPage()
         self.project_page = ProjectDetailPage()
+        self.proyectos_info_detail_page = ProyectosInfoDetailPage()
         for page in (
             self.projects_page,
+            self.proyectos_info_page,
             self.search_page,
             self.ofertas_page,
             self.project_page,
+            self.proyectos_info_detail_page,
         ):
             self.stack.addWidget(page)
         main.addWidget(self.stack, 1)
@@ -978,15 +1269,21 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Listo")
 
-        # Proyectos opens a project's detail page, so the back button
-        # returns wherever the user actually came from (set in
-        # open_project()) rather than always going to one fixed page.
-        # Buscar doesn't open project pages at all — its folder/file
-        # results open directly in Explorer instead.
+        # Proyectos/Proyectos Info each open their own detail page, so
+        # each back button returns wherever the user actually came from
+        # (set right before navigating to the detail page) rather than
+        # always going to one fixed page. Buscar doesn't open project
+        # pages at all — its folder/file results open directly in
+        # Explorer instead.
         self._project_return_index = 0
+        self._project_info_return_index = 1
         self.projects_page.project_opened.connect(self.open_project)
         self.project_page.back_button.clicked.connect(
             lambda: self._navigate(self._project_return_index)
+        )
+        self.proyectos_info_page.project_info_opened.connect(self.open_project_info)
+        self.proyectos_info_detail_page.back_button.clicked.connect(
+            lambda: self._navigate(self._project_info_return_index)
         )
 
         self._navigate(0)
@@ -1013,8 +1310,9 @@ class MainWindow(QMainWindow):
         self.nav_buttons: list[QPushButton] = []
         buttons = [
             ("▦  Proyectos", 0),
-            ("🔍  Buscar", 1),
-            ("📄  Ofertas", 2),
+            ("ℹ️  Proyectos Info", 1),
+            ("🔍  Buscar", 2),
+            ("📄  Ofertas", 3),
         ]
         for text, index in buttons:
             button = QPushButton(text)
@@ -1062,9 +1360,11 @@ class MainWindow(QMainWindow):
 
     _PAGE_TITLES = {
         0: ("Proyectos", "Lista completa de proyectos — filtra por año o por nombre"),
-        1: ("Buscar", "Buscar por nombre de carpeta, dirección o archivo"),
-        2: ("Ofertas", "Documentos Firmado y Pedido dentro de FACTURACION/INGEVIA en 02.-GESTIÓN"),
-        3: ("Proyecto", ""),
+        1: ("Proyectos Info", "Ficha de cada proyecto según el Excel (2024-2026)"),
+        2: ("Buscar", "Buscar por nombre de carpeta, dirección o archivo"),
+        3: ("Ofertas", "Documentos Firmado y Pedido dentro de FACTURACION/INGEVIA en 02.-GESTIÓN"),
+        4: ("Proyecto", ""),
+        5: ("Proyecto Info", ""),
     }
 
     def _navigate(self, index: int) -> None:
@@ -1072,11 +1372,13 @@ class MainWindow(QMainWindow):
         title, subtitle = self._PAGE_TITLES[index]
         self.top_title.setText(title)
         self.top_subtitle.setText(subtitle)
-        for button, button_index in zip(self.nav_buttons, (0, 1, 2)):
+        for button, button_index in zip(self.nav_buttons, (0, 1, 2, 3)):
             button.setChecked(button_index == index)
         if index == 0:
             self.projects_page.refresh()
-        elif index == 2:
+        elif index == 1:
+            self.proyectos_info_page.refresh()
+        elif index == 3:
             self.ofertas_page.refresh()
 
     def open_project(self, project_id: int) -> None:
@@ -1084,11 +1386,17 @@ class MainWindow(QMainWindow):
         # from it, so the project page's back button returns there.
         self._project_return_index = self.stack.currentIndex()
         self.project_page.load(project_id)
-        self._navigate(3)
+        self._navigate(4)
+
+    def open_project_info(self, item_id: int) -> None:
+        self._project_info_return_index = self.stack.currentIndex()
+        self.proyectos_info_detail_page.load(item_id)
+        self._navigate(5)
 
     def refresh_all(self) -> None:
         try:
             self.projects_page.refresh()
+            self.proyectos_info_page.refresh()
             self.search_page.refresh()
             self.ofertas_page.refresh()
             self.statusBar().showMessage("Datos actualizados", 4000)

@@ -27,7 +27,7 @@ def main():
         print("Missing config/config.yaml — copy config/config.example.yaml first.")
         sys.exit(1)
 
-    config = yaml.safe_load(config_path.read_text())
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     if "--full" in sys.argv:
         config["incremental"] = False
         print("Forcing a full rescan (--full) regardless of config.yaml.")

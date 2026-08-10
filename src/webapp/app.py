@@ -32,7 +32,10 @@ app = Flask(__name__, template_folder=str(TEMPLATE_DIR))
 
 def _load_config() -> dict:
     config_path = BASE_DIR / "config" / "config.yaml"
-    return yaml.safe_load(config_path.read_text())
+    # encoding="utf-8" explicitly — see data_service.py's load_config for
+    # why (config.yaml has accented Spanish text; the platform-default
+    # encoding isn't reliably UTF-8, especially on Windows).
+    return yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
 
 def _db_path() -> str:

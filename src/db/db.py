@@ -15,7 +15,7 @@ def open_db(db_path: str) -> sqlite3.Connection:
     # background refresh is writing to the database — without it, a long
     # crawl would lock readers out for the entire run.
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.executescript(SCHEMA_PATH.read_text())
+    conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
     return conn
 
 
