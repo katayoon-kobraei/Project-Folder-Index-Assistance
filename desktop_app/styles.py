@@ -17,6 +17,20 @@ QMainWindow, QWidget#AppRoot {
     background: #f4f7fb;
 }
 
+/* QScrollArea (Proyectos Info detail/Editar/Nuevo proyecto's scrollable
+   body) — without an explicit rule here, the scroll area's internal
+   viewport widget doesn't inherit the page's background and instead
+   falls back to a dark OS-theme default, showing up as a black band
+   wherever it peeks between/around the panels sitting inside it. Same
+   root cause as the earlier QTreeWidget dark-background issue. */
+QScrollArea {
+    background: #f4f7fb;
+    border: none;
+}
+QScrollArea > QWidget > QWidget {
+    background: #f4f7fb;
+}
+
 /* Sidebar */
 QFrame#Sidebar {
     background: qlineargradient(
@@ -221,6 +235,14 @@ QLabel#NeutralPill {
     padding: 4px 9px;
     font-weight: 700;
 }
+QLabel#InfoPill {
+    color: #1d4ed8;
+    background: #dbeafe;
+    border: 1px solid #bfdbfe;
+    border-radius: 10px;
+    padding: 4px 9px;
+    font-weight: 700;
+}
 
 /* Timeline dots (project detail page) */
 QFrame#TimelineDotMain {
@@ -272,6 +294,47 @@ QLineEdit:hover, QComboBox:hover { border-color: #8fc9b6; }
 QLineEdit:focus, QComboBox:focus {
     border: 2px solid #0F6E56;
     padding: 7px 9px;
+}
+QTextEdit {
+    background: white;
+    border: 1px solid #cfd9e6;
+    border-radius: 9px;
+    padding: 6px 9px;
+    selection-background-color: #cdeee1;
+}
+QTextEdit:focus { border: 2px solid #0F6E56; }
+
+/* Radio buttons (Editar form's Planning/Tipo/Subtipo1/Subtipo2 pickers)
+   — the indicator is drawn explicitly rather than left to the OS theme.
+   Without this, some Windows setups render the native radio glyph as a
+   tiny illegible smudge next to the label at this font size. */
+QRadioButton {
+    spacing: 10px;
+    padding: 4px 0;
+    color: #172033;
+    font-size: 13px;
+}
+QRadioButton::indicator {
+    width: 16px;
+    height: 16px;
+    border-radius: 8px;
+    border: 2px solid #cfd9e6;
+    background: white;
+}
+QRadioButton::indicator:hover { border-color: #8fc9b6; }
+QRadioButton::indicator:checked {
+    border: 2px solid #0F6E56;
+    background: qradialgradient(
+        cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5,
+        stop:0 #0F6E56, stop:0.55 #0F6E56, stop:0.65 white, stop:1 white
+    );
+}
+
+/* Dotted separator between the Editar form's category pickers */
+QFrame#DottedSeparator {
+    border: none;
+    border-top: 1px dotted #cfd9e6;
+    background: transparent;
 }
 
 /* Tables */

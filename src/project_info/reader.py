@@ -1,6 +1,7 @@
 """
-Reads the "LISTADO PROYECTOS POR AÑOS" workbook that backs the Proyectos
-Info page — a hand-maintained Excel file, NOT the crawled P: index.
+Reads (and, via writer.py, edits) the "LISTADO PROYECTOS POR AÑOS"
+workbook that backs the Proyectos Info page — a hand-maintained Excel
+file, NOT the crawled P: index.
 
 The real source is a single multi-sheet workbook (one sheet per year),
 but the app reads from a FOLDER of separate single-sheet files instead —
@@ -9,52 +10,45 @@ split_workbook_by_year() below (also runnable as
 scripts/split_project_info_by_year.py). Only 2024, 2025, and 2026
 currently have real data, so those are the only files ever read; a
 folder missing one of the three still works fine with whichever are
-present.
+present. As of the latest real files, each year sheet has a smaller set
+of columns than earlier versions did (NUMERO DE PROYECTO, PLANNING,
+NOMBRE, LISTADO DE EMPLEADOS, TRABAJOS A REALIZAR, TITULO ENTERO DEL
+PROYECTO, CIUDAD, PROVINCIA, FECHA DEL PROYECTO, PROMOTOR, TIPO,
+SUBTIPO1, SUBTIPO2) — older/fuller columns (budgets, KPIs, visado, etc.)
+are still supported below for backwards compatibility with any file that
+still has them, they just won't appear if the column is gone.
 
-Column mapping (Spanish header in the sheet -> field key), confirmed
-against the real file — a NOMBRE value is NOT unique: the same project
-can have several rows (e.g. one per document/task), each row is kept as
-its own separate entry, in the same order they appear in the sheet:
-    NOMBRE                              -> project_name (also the source
-                                            for `company`: everything
-                                            before " - ")
-    PLANNING                            -> status
-    TRABAJOS A REALIZAR                 -> work_description
-    TITULO ENTERO DEL PROYECTO          -> full_title
-    CIUDAD + PROVINCIA                  -> location ("CIUDAD (PROVINCIA)")
-    FECHA DEL PROYECTO                  -> start_date
-    PROMOTOR                            -> client
-    TIPO                                -> work_type
-    SUBTIPO1 + SUBTIPO2                 -> project_type
-    PRESUPUESTO EN Nº EJECUCIÓN MATERIAL -> budget_execution
-    m2 SUELO DESARROLLADO               -> m2_suelo
-    m2 URBANIZADO. EDIFICABILIDAD       -> m2_urbanizado
-    NOTAS                               -> notes
-    COPIAS IMPRESAS EN PAPEL O COPIAS EN CD -> copies
-    FIRMADO                             -> signed
-    FECHA DE LA FIRMA                   -> signed_date
-    VISADO                              -> visa
-    NUMERO DE EXPEDIENTE                -> file_number
-    FECHA DEL VISADO                    -> visa_date
-    WEB 1                               -> web1
-    WEB 2 COM ONLINE                    -> web2
-    KPI- CONCURSO                       -> kpi_concurso
-    KPI-M2 DESARROLLADOS                -> kpi_m2
-    KPI-DO                              -> kpi_do
-    ASISTENCIA TÉCNICA                  -> technical_assistance
-    COMIENZO DE LA OBRA                 -> work_start_date
-    FIN DE LA OBRA                      -> deadline
-    CERTIFICADO DE SOLVENCIA            -> solvency_certificate
-    PRESUPUESTO DE LAS OBRAS            -> budget_works
-    IMPORTE DEL CONTRATO                -> contract_amount
-    ADMINISTRACIÓN CONTRATANTE          -> contracting_admin
-    CERT REPR BI                        -> cert_repr_bi
-    CERT REPR IVA                       -> cert_repr_iva
-    CERT REPR TOTALES                   -> cert_repr_totales
-    NUMERO DE PROYECTO                  -> project_number
-    (none)                              -> employees_assigned: there is
-                                            NO employee count anywhere in
-                                            this workbook. Always None.
+FIELD_MAP below is the single source of truth for both directions:
+reading a cell into a row dict (load_project_info) AND writing an edited
+value back into that exact cell (writer.update_project_info_row) — kept
+in one place so the two can never drift out of sync. A NOMBRE value is
+NOT unique: the same project can have several rows (e.g. one per
+document/task), each kept as its own separate entry, in the same order
+they appear in the sheet.
+
+Four columns are constrained to a fixed set of categories in the
+original master workbook (its "TIPOS" sheet) — CATEGORY_OPTIONS below
+holds the exact confirmed lists, used to render these as single-choice
+pickers (radio buttons) instead of free text in the edit form:
+    PLANNING (-> status)     Inicio Proyecto / Proceso / Acabado /
+                              Cancelado / DO — "Inicio Proyecto" is an
+                              app-only addition, not one of the values
+                              confirmed from the master workbook's TIPOS
+                              sheet; selecting it also stamps FECHA DEL
+                              PROYECTO with that moment's date (see
+                              main_window.py's _on_category_toggled).
+    TIPO (-> work_type)      ESTUDIO / CONSULTORÍA / PROYECTO / DO + CSS
+    SUBTIPO1 (-> subtipo1)   Estación de servicio / Establecimiento /
+                              Industrial / Urbanización
+    SUBTIPO2 (-> subtipo2)   Certificado / Habilitación / Accesos /
+                              Instalaciones / DIC
+
+Two pairs of raw columns are additionally exposed as combined,
+read-only display fields for convenience (NOT written back to directly
+— editing goes through the raw city/province/subtipo1/subtipo2 fields
+instead, one column each):
+    CIUDAD + PROVINCIA   -> location ("CIUDAD (PROVINCIA)")
+    SUBTIPO1 + SUBTIPO2  -> project_type ("SUBTIPO1 / SUBTIPO2")
 """
 
 from __future__ import annotations
@@ -68,45 +62,66 @@ YEARS_WITH_DATA = ("2024", "2025", "2026")
 
 _REQUIRED_HEADERS = ("NOMBRE",)
 
-# (header text in the sheet, key in the returned row dict). Order here
-# doesn't matter for parsing (headers are matched by name, not
-# position) — it's just documentation-by-proximity to the mapping above.
-_COLUMN_MAP = [
-    ("TRABAJOS A REALIZAR", "work_description"),
-    ("TITULO ENTERO DEL PROYECTO", "full_title"),
-    ("PROMOTOR", "client"),
-    ("TIPO", "work_type"),
-    ("PRESUPUESTO EN Nº\nEJECUCIÓN MATERIAL", "budget_execution"),
-    ("m2 SUELO DESARROLLADO", "m2_suelo"),
-    ("m2 URBANIZADO. EDIFICABILIDAD", "m2_urbanizado"),
-    ("NOTAS", "notes"),
-    ("COPIAS IMPRESAS EN PAPEL O COPIAS EN CD", "copies"),
-    ("FIRMADO", "signed"),
-    ("FECHA DE LA FIRMA", "signed_date"),
-    ("VISADO", "visa"),
-    ("NUMERO DE EXPEDIENTE", "file_number"),
-    ("FECHA DEL VISADO", "visa_date"),
-    ("WEB 1", "web1"),
-    ("WEB 2 COM ONLINE", "web2"),
-    ("KPI- CONCURSO", "kpi_concurso"),
-    ("KPI-M2 DESARROLLADOS", "kpi_m2"),
-    ("KPI-DO", "kpi_do"),
-    ("ASISTENCIA TÉCNICA", "technical_assistance"),
-    ("COMIENZO DE LA OBRA", "work_start_date"),
-    ("CERTIFICADO DE SOLVENCIA", "solvency_certificate"),
-    ("PRESUPUESTO DE LAS OBRAS", "budget_works"),
-    ("IMPORTE DEL CONTRATO", "contract_amount"),
-    ("ADMINISTRACIÓN CONTRATANTE", "contracting_admin"),
-    ("CERT REPR BI", "cert_repr_bi"),
-    ("CERT REPR IVA", "cert_repr_iva"),
-    ("CERT REPR TOTALES", "cert_repr_totales"),
+# (header text in the sheet, field key, is this a date column?). Order
+# here doesn't matter for parsing (headers are matched by name, not
+# position) — it's just documentation-by-proximity.
+FIELD_MAP = [
+    ("NUMERO DE PROYECTO", "project_number", False),
+    ("NOMBRE", "project_name", False),
+    ("PLANNING", "status", False),
+    ("LISTADO DE EMPLEADOS", "employee_list", False),
+    ("TRABAJOS A REALIZAR", "work_description", False),
+    ("TITULO ENTERO DEL PROYECTO", "full_title", False),
+    ("CIUDAD", "city", False),
+    ("PROVINCIA", "province", False),
+    ("FECHA DEL PROYECTO", "start_date", True),
+    ("PROMOTOR", "client", False),
+    ("TIPO", "work_type", False),
+    ("SUBTIPO1", "subtipo1", False),
+    ("SUBTIPO2", "subtipo2", False),
+    ("COMIENZO DE LA OBRA", "work_start_date", True),
+    ("FIN DE LA OBRA", "deadline", True),
+    # Older/fuller-schema columns — kept for backwards compatibility
+    # with files that still have them.
+    ("PRESUPUESTO EN Nº\nEJECUCIÓN MATERIAL", "budget_execution", False),
+    ("m2 SUELO DESARROLLADO", "m2_suelo", False),
+    ("m2 URBANIZADO. EDIFICABILIDAD", "m2_urbanizado", False),
+    ("NOTAS", "notes", False),
+    ("COPIAS IMPRESAS EN PAPEL O COPIAS EN CD", "copies", False),
+    ("FIRMADO", "signed", False),
+    ("FECHA DE LA FIRMA", "signed_date", True),
+    ("VISADO", "visa", False),
+    ("NUMERO DE EXPEDIENTE", "file_number", False),
+    ("FECHA DEL VISADO", "visa_date", True),
+    ("WEB 1", "web1", False),
+    ("WEB 2 COM ONLINE", "web2", False),
+    ("KPI- CONCURSO", "kpi_concurso", False),
+    ("KPI-M2 DESARROLLADOS", "kpi_m2", False),
+    ("KPI-DO", "kpi_do", False),
+    ("ASISTENCIA TÉCNICA", "technical_assistance", False),
+    ("CERTIFICADO DE SOLVENCIA", "solvency_certificate", False),
+    ("PRESUPUESTO DE LAS OBRAS", "budget_works", False),
+    ("IMPORTE DEL CONTRATO", "contract_amount", False),
+    ("ADMINISTRACIÓN CONTRATANTE", "contracting_admin", False),
+    ("CERT REPR BI", "cert_repr_bi", False),
+    ("CERT REPR IVA", "cert_repr_iva", False),
+    ("CERT REPR TOTALES", "cert_repr_totales", False),
 ]
-# Headers whose raw value is a real date and should go through the
-# dd/mm/yyyy formatter, same as start_date/deadline.
-_DATE_COLUMN_MAP = [
-    ("FECHA DE LA FIRMA", "signed_date"),
-    ("FECHA DEL VISADO", "visa_date"),
-]
+
+# key -> header, and key -> is_date, derived from FIELD_MAP so writer.py
+# never has to duplicate the mapping.
+KEY_TO_HEADER = {key: header for header, key, _is_date in FIELD_MAP}
+_KEY_IS_DATE = {key: is_date for _header, key, is_date in FIELD_MAP}
+
+# Exact categories confirmed from the master workbook's "TIPOS" sheet —
+# used to render these four fields as radio-button pickers in the edit
+# form rather than free text.
+CATEGORY_OPTIONS = {
+    "status": ["Inicio Proyecto", "Proceso", "Acabado", "Cancelado", "DO"],
+    "work_type": ["ESTUDIO", "CONSULTORÍA", "PROYECTO", "DO + CSS"],
+    "subtipo1": ["Estación de servicio", "Establecimiento", "Industrial", "Urbanización"],
+    "subtipo2": ["Certificado", "Habilitación", "Accesos", "Instalaciones", "DIC"],
+}
 
 
 def _format_date(value) -> str | None:
@@ -155,9 +170,14 @@ def _rows_from_sheet(ws) -> tuple[list, list[list]]:
     return headers, data_rows
 
 
-def _row_dict_from_raw(headers: list, raw_row: list, year: int, next_id: int) -> dict | None:
+def _row_dict_from_raw(
+    headers: list, raw_row: list, year: int, next_id: int, row_number: int
+) -> dict | None:
     """Build one normalized row dict from a raw (headers, row) pair, or
-    None if this row has no NOMBRE (a blank spacer row)."""
+    None if this row has no NOMBRE (a blank spacer row). `row_number` is
+    the row's actual 1-based position in the worksheet (header is row 1,
+    so the first data row is 2) — carried along so writer.py can find
+    this exact cell again later without re-matching by content."""
     row_values = {
         headers[i]: raw_row[i]
         for i in range(min(len(headers), len(raw_row)))
@@ -167,28 +187,14 @@ def _row_dict_from_raw(headers: list, raw_row: list, year: int, next_id: int) ->
     if not project_name:
         return None
 
-    city = _cell(row_values, "CIUDAD")
-    province = _cell(row_values, "PROVINCIA")
-    location = f"{city} ({province})" if city and province else (city or province)
+    result = {"id": next_id, "year": year, "row_number": row_number}
+    for header, key, is_date in FIELD_MAP:
+        result[key] = _format_date(row_values.get(header)) if is_date else _cell(row_values, header)
 
-    result = {
-        "id": next_id,
-        "year": year,
-        "company": _company_from_name(project_name),
-        "project_name": project_name,
-        "project_number": _cell(row_values, "NUMERO DE PROYECTO"),
-        "location": location,
-        "status": _cell(row_values, "PLANNING"),
-        "project_type": _join_nonempty(
-            _cell(row_values, "SUBTIPO1"), _cell(row_values, "SUBTIPO2")
-        ),
-        "start_date": _format_date(row_values.get("FECHA DEL PROYECTO")),
-        "deadline": _format_date(row_values.get("FIN DE LA OBRA")),
-        "work_start_date": _format_date(row_values.get("COMIENZO DE LA OBRA")),
-        "employees_assigned": None,
-    }
-    for header, key in _COLUMN_MAP:
-        result[key] = _cell(row_values, header)
+    result["company"] = _company_from_name(project_name)
+    city, province = result.get("city"), result.get("province")
+    result["location"] = f"{city} ({province})" if city and province else (city or province)
+    result["project_type"] = _join_nonempty(result.get("subtipo1"), result.get("subtipo2"))
     return result
 
 
@@ -270,8 +276,9 @@ def load_project_info(dir_path: str) -> list[dict]:
             if not any(h in _REQUIRED_HEADERS for h in headers):
                 continue  # doesn't look like a project table at all
 
-            for raw_row in data_rows:
-                row_dict = _row_dict_from_raw(headers, raw_row, year, next_id)
+            for offset, raw_row in enumerate(data_rows):
+                row_number = offset + 2  # row 1 is the header
+                row_dict = _row_dict_from_raw(headers, raw_row, year, next_id, row_number)
                 if row_dict is None:
                     continue
                 results.append(row_dict)

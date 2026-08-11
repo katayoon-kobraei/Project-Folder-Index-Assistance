@@ -35,6 +35,7 @@ from src.search.search import (  # noqa: E402
     search_projects,
 )
 from src.project_info.reader import YEARS_WITH_DATA, load_project_info  # noqa: E402
+from src.project_info import writer as project_info_writer  # noqa: E402
 from src.webapp import pipeline  # noqa: E402
 
 CONFIG_PATH = BASE_DIR / "config" / "config.yaml"
@@ -200,6 +201,48 @@ def project_info_detail(item_id: int) -> dict | None:
         if row["id"] == item_id:
             return row
     return None
+
+
+def update_project_info(item_id: int, updates: dict) -> dict:
+    """Save edits from the Editar form for one project_info row straight
+    into its source cell (see src/project_info/writer.py — only that one
+    row/those cells are touched, nothing else in the file changes).
+    Raises FileNotFoundError if item_id no longer matches any row (e.g.
+    the underlying file changed since the page was opened) or if the
+    year's file is missing, and ValueError if a date field is invalid.
+
+    Returns the freshly re-read row for item_id, since editing the file
+    changes its mtime — project_info_rows()'s cache is keyed on that, so
+    the very next call already reflects the edit, no manual cache
+    invalidation needed here."""
+    row = project_info_detail(item_id)
+    if row is None:
+        raise FileNotFoundError("Este proyecto ya no está en el archivo de datos.")
+    project_info_writer.update_project_info_row(
+        _project_info_dir(), row["year"], row["row_number"], updates
+    )
+    return project_info_detail(item_id)
+
+
+def create_project_info(year: int, values: dict) -> dict:
+    """Add a brand-new project row to {year}.xlsx (see
+    src/project_info/writer.py's append_project_info_row — this only
+    ever writes ONE new row, nothing existing is touched) from the
+    "Nuevo proyecto" form. Raises FileNotFoundError if that year's file
+    doesn't exist, and ValueError if a date field is invalid or NOMBRE
+    is blank.
+
+    Returns the freshly re-read row for the new project — same
+    mtime-based cache invalidation as update_project_info(), so this
+    already reflects reality by the time project_info_rows() runs
+    again."""
+    project_info_writer.append_project_info_row(_project_info_dir(), year, values)
+    rows = project_info_rows()
+    # The new row is always the last one for this year in sheet order —
+    # load_project_info() reads top-to-bottom and this was just appended
+    # at the very bottom of the sheet.
+    year_rows = [r for r in rows if r["year"] == year]
+    return year_rows[-1]
 
 
 def all_projects(name_query: str = "", year: int | None = None) -> list[dict]:

@@ -21,6 +21,7 @@ graph never depends on network speed or connectivity.
 
 from __future__ import annotations
 
+import datetime
 import json
 import time
 from pathlib import Path
@@ -41,12 +42,14 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSizePolicy,
     QStackedWidget,
     QStatusBar,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -61,6 +64,7 @@ except ImportError:  # pragma: no cover - depends on the machine's PySide6 build
     _HAS_WEBENGINE = False
 
 from desktop_app import data_service
+from src.project_info.reader import CATEGORY_OPTIONS, YEARS_WITH_DATA  # noqa: E402
 
 STAGE_LABELS = {
     "crawling": "Recorriendo carpetas...",
@@ -237,8 +241,12 @@ class ProjectsPage(QWidget):
         self.table.setRowCount(len(self._rows))
         for row_idx, project in enumerate(self._rows):
             self.table.setItem(row_idx, 0, QTableWidgetItem(project["canonical_name"]))
-            self.table.setItem(row_idx, 1, QTableWidgetItem(str(project.get("first_seen_year") or "?")))
-            self.table.setItem(row_idx, 2, QTableWidgetItem(str(project.get("last_seen_year") or "?")))
+            start_item = QTableWidgetItem(str(project.get("first_seen_year") or "?"))
+            start_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row_idx, 1, start_item)
+            end_item = QTableWidgetItem(str(project.get("last_seen_year") or "?"))
+            end_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row_idx, 2, end_item)
         self.table.resizeColumnsToContents()
         self.table.setUpdatesEnabled(True)
 
@@ -678,15 +686,18 @@ PROJECT_INFO_FIELDS = [
     # appear on the card at all for a project/row where it's blank (see
     # ProyectosInfoDetailPage.load()), so listing all of them here costs
     # nothing when most rows only have a handful filled in.
+    #
+    # NOTE: "work_type"/"project_type" (TIPO/SUBTIPO1/SUBTIPO2) are
+    # deliberately NOT listed here — they're covered by the live radio
+    # pickers in categories_panel instead (see EDIT_CATEGORY_FIELDS
+    # below), which show them individually rather than pre-joined and
+    # let you change them directly, so repeating them as plain text here
+    # too would just be a stale-looking duplicate.
     ("Cliente", "client"),
     ("Ubicación", "location"),
     ("Año", "year"),
-    ("Empleados asignados actualmente", "employees_assigned"),
-    ("Fecha del proyecto", "start_date"),
     ("Comienzo de la obra", "work_start_date"),
     ("Fecha límite (fin de la obra)", "deadline"),
-    ("Categoría de tipo de trabajo", "work_type"),
-    ("Categoría de tipo de proyecto", "project_type"),
     ("Número de proyecto", "project_number"),
     ("Trabajos a realizar", "work_description"),
     ("Título completo", "full_title"),
@@ -715,6 +726,50 @@ PROJECT_INFO_FIELDS = [
     ("Notas", "notes"),
 ]
 
+# "Lista de empleados" and "Fecha del proyecto" are NOT in
+# PROJECT_INFO_FIELDS above — unlike every other field, these two are
+# always shown on the card (with a placeholder when empty), never hidden
+# for being blank, per explicit request: every project should have both
+# sections visible. Fecha del proyecto in particular gets auto-filled
+# with today's date the moment "Inicio Proyecto" is picked in the
+# Planning radios (see _on_category_toggled), so it needs to be visible
+# even before that happens, not just after. See reader.py's module
+# docstring for the exact source column names.
+EMPLOYEE_LIST_FIELD = ("Lista de empleados", "employee_list")
+START_DATE_FIELD = ("Fecha del proyecto", "start_date")
+# Always rendered first on the card, in this order, before the
+# hide-when-blank PROJECT_INFO_FIELDS below.
+ALWAYS_SHOWN_FIELDS = [EMPLOYEE_LIST_FIELD, START_DATE_FIELD]
+
+# Fields shown in the "Editar" form — a fixed, narrower list than
+# PROJECT_INFO_FIELDS above, matching the columns the real 2024/2025/
+# 2026 files actually have today (see reader.py's FIELD_MAP). Unlike the
+# read-only card, this doesn't hide/show fields per row — every field is
+# always present in the form, blank if the row has nothing there yet.
+EDIT_TEXT_FIELDS = [
+    ("Número de proyecto", "project_number"),
+    ("Nombre", "project_name"),
+    ("Trabajos a realizar", "work_description"),
+    ("Título entero del proyecto", "full_title"),
+    ("Ciudad", "city"),
+    ("Provincia", "province"),
+    ("Fecha del proyecto (dd/mm/aaaa)", "start_date"),
+    ("Promotor", "client"),
+]
+EDIT_MULTILINE_FIELDS = [
+    ("Lista de empleados", "employee_list"),
+]
+# The 4 columns constrained to a fixed set of categories in the source
+# workbook (see reader.CATEGORY_OPTIONS) — rendered as radio buttons
+# instead of free text, so only a valid category can ever be saved.
+EDIT_CATEGORY_FIELDS = [
+    ("Planning", "status"),
+    ("Tipo", "work_type"),
+    ("Subtipo1", "subtipo1"),
+    ("Subtipo2", "subtipo2"),
+]
+_SIN_ESPECIFICAR = "(Sin especificar)"
+
 # Colored pill for the PLANNING column — shown as a badge next to each
 # project (in the list AND on its detail page), not as a plain text row
 # among the other fields, since it's the one status every single project
@@ -724,6 +779,7 @@ _PLANNING_PILL_STYLES = {
     "Cancelado": "ErrorPill",
     "Proceso": "WarningPill",
     "DO": "NeutralPill",
+    "Inicio Proyecto": "InfoPill",
 }
 
 
@@ -751,11 +807,13 @@ class ProyectosInfoPage(QWidget):
     in that file (see src/project_info/reader.py), so those are the only
     years that can ever appear here. The list shows each project's raw
     NOMBRE value exactly as it reads in the workbook (no derived company
-    prefix), plus its PLANNING status as a small colored pill (every
-    2024-2026 row has this filled in) — clicking a row opens its own
-    detail card (ProyectosInfoDetailPage), not a table."""
+    prefix), its TITULO ENTERO DEL PROYECTO (blank if the row has none),
+    and its PLANNING status as a small colored pill (every 2024-2026 row
+    has this filled in) — clicking a row opens its own detail card
+    (ProyectosInfoDetailPage), not a table."""
 
     project_info_opened = Signal(int)
+    new_project_requested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -763,9 +821,17 @@ class ProyectosInfoPage(QWidget):
         outer.setContentsMargins(26, 22, 26, 26)
         outer.setSpacing(14)
 
+        heading_row = QHBoxLayout()
         heading = QLabel("Proyectos Info")
         heading.setObjectName("SectionTitle")
-        outer.addWidget(heading)
+        heading_row.addWidget(heading)
+        heading_row.addStretch()
+        self.new_project_button = QPushButton("+  Nuevo proyecto")
+        self.new_project_button.setObjectName("PrimaryButton")
+        self.new_project_button.setCursor(Qt.PointingHandCursor)
+        self.new_project_button.clicked.connect(self.new_project_requested.emit)
+        heading_row.addWidget(self.new_project_button)
+        outer.addLayout(heading_row)
 
         subtitle = QLabel(
             "Datos del archivo Excel de proyectos (2024, 2025 y 2026 — únicos años "
@@ -777,24 +843,38 @@ class ProyectosInfoPage(QWidget):
 
         self.filter_box = QLineEdit()
         self.filter_box.setPlaceholderText("Filtrar por nombre de proyecto...")
-        self.filter_box.textChanged.connect(self._render)
+        self.filter_box.textChanged.connect(self._on_filter_changed)
         outer.addWidget(self.filter_box)
+
+        # Filtering just show/hides existing rows (see _apply_filter) —
+        # cheap — but debounced anyway so a fast typist doesn't trigger
+        # it on every single keystroke.
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(150)
+        self._filter_timer.timeout.connect(self._apply_filter)
 
         self.count_label = QLabel("")
         self.count_label.setObjectName("MutedText")
         outer.addWidget(self.count_label)
 
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(2)
-        self.tree.setHeaderLabels(["Proyecto", "Estado"])
+        self.tree.setColumnCount(3)
+        self.tree.setHeaderLabels(["Estado", "Proyecto", "Título"])
         self.tree.setAlternatingRowColors(True)
         self.tree.setRootIsDecorated(True)
-        # Full NOMBRE value, not truncated to the visible width — same
-        # idea as Ruta/Carpeta elsewhere in the app: let the column grow
-        # past the window edge and rely on the tree's own scrollbar. The
-        # Estado column stays a small fixed width for its colored pill.
+        # Estado first (small fixed width for its colored pill), then
+        # Proyecto and Título — both full NOMBRE/TITULO ENTERO DEL
+        # PROYECTO values, not truncated to the visible width, same idea
+        # as Ruta/Carpeta elsewhere in the app: let them grow to fit
+        # their full text (see resizeColumnToContents calls in _render)
+        # and rely on the tree's own horizontal scrollbar past the
+        # window edge.
         self.tree.header().setStretchLastSection(False)
-        self.tree.setColumnWidth(1, 110)
+        # Wide enough for the longest pill text ("Sin estado") without
+        # Qt squeezing the pill widget to fit the column, which distorts
+        # it into an illegible sliver instead of just clipping cleanly.
+        self.tree.setColumnWidth(0, 160)
         self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
         outer.addWidget(self.tree, 1)
 
@@ -802,15 +882,47 @@ class ProyectosInfoPage(QWidget):
         self._error: str | None = None
 
     def refresh(self) -> None:
+        """Called every time this page is navigated to — NOT just when
+        the underlying data actually changed. data_service.
+        project_info_rows() returns the exact same list object (not just
+        an equal one) when nothing's changed since the last read, so
+        comparing by identity (`is`) below skips rebuilding ~370+ tree
+        items and status pills on every single visit to this page, only
+        doing it when there's something new to show."""
         try:
-            self._rows = data_service.project_info_rows()
-            self._error = None
+            rows = data_service.project_info_rows()
+            error = None
         except Exception as exc:
-            self._rows = []
-            self._error = str(exc)
-        self._render()
+            rows = []
+            error = str(exc)
 
-    def _render(self) -> None:
+        if rows is self._rows and error == self._error:
+            return
+
+        self._rows = rows
+        self._error = error
+        self._build_tree()
+
+    def _build_tree(self) -> None:
+        """Full (re)build of every year/project/pill in the tree,
+        ignoring the filter box — only called from refresh() when the
+        row data actually changed. Filtering itself is handled
+        separately by _apply_filter(), which just shows/hides these
+        already-built items instead of recreating them, since that's by
+        far the more frequent operation (every keystroke).
+
+        Every child item is built and parented to its year_item BEFORE
+        that year_item is attached to the tree (via the QTreeWidgetItem
+        (parent, values) constructor form, then one single
+        addTopLevelItems() call at the end) — NOT year_item.addChild()
+        in a loop while year_item is already live in the tree. That
+        distinction is the entire reason this used to take ~3 seconds
+        for only ~370 rows: adding children one at a time to a parent
+        that's already part of the on-screen tree makes Qt redo its
+        internal layout bookkeeping on every single insertion, which
+        gets quadratically worse as the list grows. Building the whole
+        subtree off-tree first and attaching it in one shot avoids that
+        entirely — same end result, a small fraction of the time."""
         self.tree.setUpdatesEnabled(False)
         self.tree.clear()
 
@@ -819,22 +931,17 @@ class ProyectosInfoPage(QWidget):
             self.tree.setUpdatesEnabled(True)
             return
 
-        filter_text = self.filter_box.text().strip().lower()
         by_year: dict[int, list[dict]] = {}
         for row in self._rows:
-            if filter_text and filter_text not in (row["project_name"] or "").lower():
-                continue
             by_year.setdefault(row["year"], []).append(row)
 
-        total = sum(len(rows) for rows in by_year.values())
-        self.count_label.setText(f"{total} proyecto(s)")
-
+        year_items = []
         for year in sorted(by_year.keys(), reverse=True):
             year_item = QTreeWidgetItem([str(year)])
             bold_font = year_item.font(0)
             bold_font.setBold(True)
             year_item.setFont(0, bold_font)
-            self.tree.addTopLevelItem(year_item)
+            pills = []
             # NOT re-sorted — kept in the same order the rows appear in
             # the source spreadsheet (by_year[year] is already in that
             # order, since reader.py appends rows as it reads them and
@@ -842,13 +949,57 @@ class ProyectosInfoPage(QWidget):
             # rows can share one project name, each representing a
             # different document/task for it, in a specific sequence.
             for row in by_year[year]:
-                child = QTreeWidgetItem([row["project_name"] or ""])
+                # Column 0 is left blank in the item's own text — the
+                # status pill widget sits there instead (see
+                # setItemWidget below). Column 0 also still carries the
+                # row's id via setData, independent of what's visibly
+                # shown there. Column 1's text (Proyecto) also doubles
+                # as what _apply_filter() matches against.
+                child = QTreeWidgetItem(
+                    year_item, ["", row["project_name"] or "", row.get("full_title") or ""]
+                )
                 child.setData(0, Qt.UserRole, row["id"])
-                year_item.addChild(child)
-                self.tree.setItemWidget(child, 1, _make_status_pill(row.get("status")))
+                pills.append((child, row.get("status")))
+            year_items.append((year_item, pills))
+
+        self.tree.addTopLevelItems([year_item for year_item, _pills in year_items])
+        for year_item, pills in year_items:
+            for child, status in pills:
+                self.tree.setItemWidget(child, 0, _make_status_pill(status))
             year_item.setExpanded(True)
 
-        self.tree.resizeColumnToContents(0)
+        self.tree.resizeColumnToContents(1)
+        self.tree.resizeColumnToContents(2)
+        self.tree.setUpdatesEnabled(True)
+        self._apply_filter()
+
+    def _on_filter_changed(self) -> None:
+        self._filter_timer.start()  # restarts the 150ms countdown on every keystroke
+
+    def _apply_filter(self) -> None:
+        """Shows/hides the tree's EXISTING items to match the filter box
+        — no items are created or destroyed here, which is what keeps
+        this fast enough to run on every keystroke (after the debounce)
+        even with several hundred rows."""
+        self.tree.setUpdatesEnabled(False)
+        filter_text = self.filter_box.text().strip().lower()
+        total_visible = 0
+
+        for i in range(self.tree.topLevelItemCount()):
+            year_item = self.tree.topLevelItem(i)
+            year_visible_count = 0
+            for j in range(year_item.childCount()):
+                child = year_item.child(j)
+                matches = not filter_text or filter_text in child.text(1).lower()
+                child.setHidden(not matches)
+                if matches:
+                    year_visible_count += 1
+            year_item.setHidden(year_visible_count == 0)
+            total_visible += year_visible_count
+
+        self.count_label.setText(
+            self._error or f"{total_visible} proyecto(s)"
+        )
         self.tree.setUpdatesEnabled(True)
 
     def _on_item_double_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
@@ -859,13 +1010,28 @@ class ProyectosInfoPage(QWidget):
 
 class ProyectosInfoDetailPage(QWidget):
     """Card-style detail view for one row from the project info workbook
-    — a label/value grid, not a table. Only fields that actually have a
-    value in the workbook are shown; a field that's blank for this
-    particular project (e.g. most rows have no TIPO, and NONE currently
-    have Empleados/Fecha límite — see reader.py's module docstring) is
-    left out of the card entirely rather than shown as empty, per the
-    explicit request. The card is rebuilt from scratch on every load()
-    since which fields are present varies row to row."""
+    — a label/value grid, not a table. Most fields only appear when
+    they actually have a value for this project (e.g. most rows have no
+    TIPO); a blank one is left out of the card entirely rather than shown
+    as empty, per the explicit request. "Lista de empleados" is the one
+    exception — it's always shown first, even with no data, with a "Sin
+    datos todavía" placeholder (see EMPLOYEE_LIST_FIELD above). The card
+    is rebuilt from scratch on every load() since which fields are
+    present varies row to row.
+
+    The 4 category fields (Planning/Tipo/Subtipo1/Subtipo2 — each backed
+    by a fixed set of options, see reader.CATEGORY_OPTIONS) live directly
+    on this read view, in `categories_panel`, as always-interactive radio
+    buttons — NOT behind the "Editar" button. Clicking one saves that
+    single field immediately (see _on_category_toggled): no separate
+    Guardar step for these four. The "Editar" button instead opens a
+    separate, fixed-layout form (built once in __init__, not rebuilt per
+    row) for the remaining fields — a plain text field per
+    EDIT_TEXT_FIELDS entry plus a small multi-line box for "Lista de
+    empleados" — where Guardar/Cancelar behave as a normal batch edit.
+    Both paths go through data_service.update_project_info(), which
+    writes straight back into that exact row's cells in the source xlsx
+    (see writer.py) — nothing else in the file is touched."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -873,10 +1039,18 @@ class ProyectosInfoDetailPage(QWidget):
         outer.setContentsMargins(26, 22, 26, 26)
         outer.setSpacing(14)
 
+        top_bar = QHBoxLayout()
         self.back_button = QPushButton("←  Volver")
         self.back_button.setObjectName("LinkButton")
         self.back_button.setCursor(Qt.PointingHandCursor)
-        outer.addWidget(self.back_button, alignment=Qt.AlignLeft)
+        top_bar.addWidget(self.back_button, alignment=Qt.AlignLeft)
+        top_bar.addStretch()
+        self.edit_button = QPushButton("✏️  Editar")
+        self.edit_button.setObjectName("SecondaryButton")
+        self.edit_button.setCursor(Qt.PointingHandCursor)
+        self.edit_button.clicked.connect(self._enter_edit_mode)
+        top_bar.addWidget(self.edit_button)
+        outer.addLayout(top_bar)
 
         self.title_label = QLabel("")
         self.title_label.setObjectName("PageTitle")
@@ -887,10 +1061,23 @@ class ProyectosInfoDetailPage(QWidget):
         self.status_pill.setVisible(False)
         outer.addWidget(self.status_pill, alignment=Qt.AlignLeft)
 
+        # Everything below (the fields card, the category pickers, and
+        # the Editar form) lives inside ONE shared scroll area rather
+        # than directly in `outer`. Without it, all of that gets squeezed
+        # into whatever vertical space is left in the window — that's
+        # what was making the radio buttons render as illegible slivers
+        # with no room for their labels once categories_panel joined the
+        # card on this page. Title/status stay outside it, always
+        # visible at the top regardless of how far you've scrolled.
+        content_widget = QWidget()
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(14)
+
         self.empty_label = QLabel("Este proyecto no tiene ningún otro dato en el archivo.")
         self.empty_label.setObjectName("MutedText")
         self.empty_label.setVisible(False)
-        outer.addWidget(self.empty_label)
+        content_layout.addWidget(self.empty_label)
 
         self.card = QFrame()
         self.card.setObjectName("Panel")
@@ -899,10 +1086,174 @@ class ProyectosInfoDetailPage(QWidget):
         self.card_layout.setHorizontalSpacing(18)
         self.card_layout.setVerticalSpacing(14)
         self.card_layout.setColumnStretch(1, 1)
-        outer.addWidget(self.card)
-        outer.addStretch()
+        content_layout.addWidget(self.card)
+
+        # Always part of the read view (shown/hidden together with
+        # `card`, never gated behind "Editar") — each pick saves that one
+        # field immediately, see _on_category_toggled.
+        self.categories_panel = self._build_categories_panel()
+        content_layout.addWidget(self.categories_panel)
+
+        self.edit_panel = self._build_edit_panel()
+        self.edit_panel.setVisible(False)
+        content_layout.addWidget(self.edit_panel)
+
+        content_layout.addStretch()
+
+        self.content_scroll = QScrollArea()
+        self.content_scroll.setWidgetResizable(True)
+        self.content_scroll.setFrameShape(QFrame.NoFrame)
+        self.content_scroll.setWidget(content_widget)
+        outer.addWidget(self.content_scroll, 1)
 
         self._item_id: int | None = None
+        self._data: dict | None = None
+
+    def _build_categories_panel(self) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("Panel")
+        layout = QGridLayout(panel)
+        layout.setContentsMargins(22, 20, 22, 20)
+        layout.setHorizontalSpacing(18)
+        layout.setVerticalSpacing(14)
+        layout.setColumnStretch(1, 1)
+        row = 0
+
+        # value (a canonical option, or None for "sin especificar") ->
+        # its QRadioButton, one dict per category field — plus the
+        # QButtonGroup itself, needed to block/unblock its signals while
+        # load() sets the current selection programmatically (so that
+        # doesn't get mistaken for the user clicking a new option and
+        # trigger a write).
+        self._category_radio_buttons: dict[str, dict[str | None, QRadioButton]] = {}
+        self._category_groups: dict[str, QButtonGroup] = {}
+        for idx, (label_text, key) in enumerate(EDIT_CATEGORY_FIELDS):
+            if idx > 0:
+                separator = QFrame()
+                separator.setObjectName("DottedSeparator")
+                separator.setFixedHeight(1)
+                layout.addWidget(separator, row, 0, 1, 2)
+                row += 1
+
+            label = QLabel(label_text + ":")
+            label.setObjectName("MetricTitle")
+            label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+
+            options_widget = QWidget()
+            options_layout = QVBoxLayout(options_widget)
+            options_layout.setContentsMargins(0, 0, 0, 0)
+            options_layout.setSpacing(4)
+            group = QButtonGroup(options_widget)
+            self._category_groups[key] = group
+
+            buttons: dict[str | None, QRadioButton] = {}
+            none_button = QRadioButton(_SIN_ESPECIFICAR)
+            group.addButton(none_button)
+            options_layout.addWidget(none_button)
+            buttons[None] = none_button
+            for option in CATEGORY_OPTIONS[key]:
+                button = QRadioButton(option)
+                group.addButton(button)
+                options_layout.addWidget(button)
+                buttons[option] = button
+            self._category_radio_buttons[key] = buttons
+
+            group.buttonToggled.connect(
+                lambda button, checked, key=key: self._on_category_toggled(key, button, checked)
+            )
+
+            layout.addWidget(label, row, 0)
+            layout.addWidget(options_widget, row, 1)
+            row += 1
+
+        return panel
+
+    def _sync_category_radios(self, data: dict | None) -> None:
+        """Select the radio matching each category field's current value
+        — WITHOUT triggering _on_category_toggled (signals blocked),
+        since this just reflects already-saved state, it isn't a user
+        edit to write back."""
+        for _label, key in EDIT_CATEGORY_FIELDS:
+            current = data.get(key) if data else None
+            buttons = self._category_radio_buttons[key]
+            group = self._category_groups[key]
+            group.blockSignals(True)
+            buttons.get(current, buttons[None]).setChecked(True)
+            group.blockSignals(False)
+
+    def _on_category_toggled(self, key: str, button: QRadioButton, checked: bool) -> None:
+        # QButtonGroup fires buttonToggled twice per click — once for the
+        # button losing the check, once for the one gaining it. Only
+        # react to the latter.
+        if not checked or self._item_id is None:
+            return
+        value = next(
+            (candidate for candidate, btn in self._category_radio_buttons[key].items() if btn is button),
+            None,
+        )
+        updates = {key: value}
+        # Picking "Inicio Proyecto" also stamps FECHA DEL PROYECTO with
+        # that exact moment's date — the whole point of that option — in
+        # the SAME write as the status change, not a separate save.
+        if key == "status" and value == "Inicio Proyecto":
+            updates["start_date"] = datetime.date.today().strftime("%d/%m/%Y")
+        try:
+            data_service.update_project_info(self._item_id, updates)
+        except Exception as exc:
+            QMessageBox.critical(self, "No se pudo guardar", str(exc))
+            self._sync_category_radios(self._data)  # revert the radio to the last saved value
+            return
+        # Full reload — cheap at this dataset's size, and guarantees the
+        # status pill, the card's derived fields, and every other
+        # category radio stay in sync with what's now actually on disk.
+        self.load(self._item_id)
+
+    def _build_edit_panel(self) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("Panel")
+        layout = QGridLayout(panel)
+        layout.setContentsMargins(22, 20, 22, 20)
+        layout.setHorizontalSpacing(18)
+        layout.setVerticalSpacing(14)
+        layout.setColumnStretch(1, 1)
+        row = 0
+
+        self._edit_inputs: dict[str, QLineEdit] = {}
+        for label_text, key in EDIT_TEXT_FIELDS:
+            label = QLabel(label_text + ":")
+            label.setObjectName("MetricTitle")
+            label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+            field = QLineEdit()
+            layout.addWidget(label, row, 0)
+            layout.addWidget(field, row, 1)
+            self._edit_inputs[key] = field
+            row += 1
+
+        self._edit_multiline: dict[str, QTextEdit] = {}
+        for label_text, key in EDIT_MULTILINE_FIELDS:
+            label = QLabel(label_text + ":")
+            label.setObjectName("MetricTitle")
+            label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+            field = QTextEdit()
+            field.setMaximumHeight(70)
+            layout.addWidget(label, row, 0)
+            layout.addWidget(field, row, 1)
+            self._edit_multiline[key] = field
+            row += 1
+
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+        self.cancel_button = QPushButton("Cancelar")
+        self.cancel_button.setObjectName("LinkButton")
+        self.cancel_button.clicked.connect(self._exit_edit_mode)
+        button_row.addWidget(self.cancel_button)
+        self.save_button = QPushButton("Guardar")
+        self.save_button.setObjectName("PrimaryButton")
+        self.save_button.clicked.connect(self._save_edit)
+        button_row.addWidget(self.save_button)
+        layout.addLayout(button_row, row, 0, 1, 2)
+
+        return panel
 
     def _clear_card(self) -> None:
         while self.card_layout.count():
@@ -913,6 +1264,8 @@ class ProyectosInfoDetailPage(QWidget):
 
     def load(self, item_id: int) -> None:
         self._item_id = item_id
+        self.edit_panel.setVisible(False)
+        self.edit_button.setVisible(True)
         try:
             data = data_service.project_info_detail(item_id)
         except Exception as exc:
@@ -923,6 +1276,7 @@ class ProyectosInfoDetailPage(QWidget):
                 self, "No encontrado", "Este proyecto ya no está en el archivo de datos."
             )
             return
+        self._data = data
 
         self.title_label.setText(data.get("project_name") or "(Sin nombre)")
 
@@ -936,8 +1290,28 @@ class ProyectosInfoDetailPage(QWidget):
         self.status_pill.style().unpolish(self.status_pill)
         self.status_pill.style().polish(self.status_pill)
 
+        self._sync_category_radios(data)
+
         self._clear_card()
+        self.card.setVisible(True)
+        self.categories_panel.setVisible(True)
         row_idx = 0
+
+        # Always shown first, even with no data yet — see
+        # ALWAYS_SHOWN_FIELDS' comment above.
+        for label_text, key in ALWAYS_SHOWN_FIELDS:
+            value = data.get(key)
+            label = QLabel(label_text + ":")
+            label.setObjectName("MetricTitle")
+            label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+            value_label = QLabel(str(value) if value not in (None, "") else "Sin datos todavía")
+            value_label.setWordWrap(True)
+            if value in (None, ""):
+                value_label.setObjectName("MutedText")
+            self.card_layout.addWidget(label, row_idx, 0)
+            self.card_layout.addWidget(value_label, row_idx, 1)
+            row_idx += 1
+
         for label_text, key in PROJECT_INFO_FIELDS:
             value = data.get(key)
             if value in (None, ""):
@@ -951,8 +1325,243 @@ class ProyectosInfoDetailPage(QWidget):
             self.card_layout.addWidget(value_label, row_idx, 1)
             row_idx += 1
 
-        self.card.setVisible(row_idx > 0)
-        self.empty_label.setVisible(row_idx == 0)
+        self.empty_label.setVisible(False)
+
+    def _enter_edit_mode(self) -> None:
+        if self._item_id is None:
+            return
+        data = self._data
+
+        for _label, key in EDIT_TEXT_FIELDS:
+            self._edit_inputs[key].setText(data.get(key) or "")
+        for _label, key in EDIT_MULTILINE_FIELDS:
+            self._edit_multiline[key].setPlainText(data.get(key) or "")
+
+        # categories_panel stays out of this mode entirely — it saves
+        # each field the instant you click it (see
+        # _on_category_toggled), so it's hidden alongside `card` while
+        # there's a batch of OTHER unsaved edits in progress here, to
+        # avoid any confusion about what's saved and what isn't.
+        self.card.setVisible(False)
+        self.categories_panel.setVisible(False)
+        self.status_pill.setVisible(False)
+        self.edit_button.setVisible(False)
+        self.edit_panel.setVisible(True)
+
+    def _exit_edit_mode(self) -> None:
+        self.load(self._item_id)
+
+    def _save_edit(self) -> None:
+        updates: dict[str, str | None] = {}
+        for _label, key in EDIT_TEXT_FIELDS:
+            updates[key] = self._edit_inputs[key].text().strip() or None
+        for _label, key in EDIT_MULTILINE_FIELDS:
+            updates[key] = self._edit_multiline[key].toPlainText().strip() or None
+
+        try:
+            data_service.update_project_info(self._item_id, updates)
+        except Exception as exc:
+            QMessageBox.critical(self, "No se pudo guardar", str(exc))
+            return
+
+        self.load(self._item_id)
+
+
+class ProyectosInfoNewPage(QWidget):
+    """Form to add a brand-new row to one of the 2024/2025/2026 xlsx
+    files (see src/project_info/writer.py's append_project_info_row —
+    only ever writes that one new row, nothing existing is touched).
+    Same field set as ProyectosInfoDetailPage's Editar form (text fields
+    + "Lista de empleados" + the 4 category radio pickers), plus a year
+    picker up top since a new row has to go into exactly one file, and
+    unlike the detail page's always-instant category pickers, everything
+    here is one batch write on "Crear proyecto" — there's no existing
+    row to save into until that button is pressed. Built once; reset()
+    blanks every field back out each time the page is (re)opened."""
+
+    project_created = Signal(int)  # the new row's id, so the caller can open its detail page
+
+    def __init__(self) -> None:
+        super().__init__()
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(26, 22, 26, 26)
+        outer.setSpacing(14)
+
+        self.back_button = QPushButton("←  Cancelar")
+        self.back_button.setObjectName("LinkButton")
+        self.back_button.setCursor(Qt.PointingHandCursor)
+        outer.addWidget(self.back_button, alignment=Qt.AlignLeft)
+
+        heading = QLabel("Nuevo proyecto")
+        heading.setObjectName("PageTitle")
+        outer.addWidget(heading)
+
+        subtitle = QLabel(
+            "Se añadirá como una fila nueva al final del archivo del año elegido."
+        )
+        subtitle.setObjectName("MutedText")
+        subtitle.setWordWrap(True)
+        outer.addWidget(subtitle)
+
+        content_widget = QWidget()
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(14)
+
+        form_panel = QFrame()
+        form_panel.setObjectName("Panel")
+        layout = QGridLayout(form_panel)
+        layout.setContentsMargins(22, 20, 22, 20)
+        layout.setHorizontalSpacing(18)
+        layout.setVerticalSpacing(14)
+        layout.setColumnStretch(1, 1)
+        row = 0
+
+        year_label = QLabel("Año:")
+        year_label.setObjectName("MetricTitle")
+        year_options = QWidget()
+        year_options_layout = QHBoxLayout(year_options)
+        year_options_layout.setContentsMargins(0, 0, 0, 0)
+        year_options_layout.setSpacing(16)
+        self._year_group = QButtonGroup(year_options)
+        self._year_buttons: dict[str, QRadioButton] = {}
+        for year_str in YEARS_WITH_DATA:
+            button = QRadioButton(year_str)
+            self._year_group.addButton(button)
+            year_options_layout.addWidget(button)
+            self._year_buttons[year_str] = button
+        year_options_layout.addStretch()
+        layout.addWidget(year_label, row, 0)
+        layout.addWidget(year_options, row, 1)
+        row += 1
+
+        separator = QFrame()
+        separator.setObjectName("DottedSeparator")
+        separator.setFixedHeight(1)
+        layout.addWidget(separator, row, 0, 1, 2)
+        row += 1
+
+        self._new_inputs: dict[str, QLineEdit] = {}
+        for label_text, key in EDIT_TEXT_FIELDS:
+            label = QLabel(label_text + (" *:" if key == "project_name" else ":"))
+            label.setObjectName("MetricTitle")
+            label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+            field = QLineEdit()
+            layout.addWidget(label, row, 0)
+            layout.addWidget(field, row, 1)
+            self._new_inputs[key] = field
+            row += 1
+
+        self._new_multiline: dict[str, QTextEdit] = {}
+        for label_text, key in EDIT_MULTILINE_FIELDS:
+            label = QLabel(label_text + ":")
+            label.setObjectName("MetricTitle")
+            label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+            field = QTextEdit()
+            field.setMaximumHeight(70)
+            layout.addWidget(label, row, 0)
+            layout.addWidget(field, row, 1)
+            self._new_multiline[key] = field
+            row += 1
+
+        self._new_radio_buttons: dict[str, dict[str | None, QRadioButton]] = {}
+        for idx, (label_text, key) in enumerate(EDIT_CATEGORY_FIELDS):
+            cat_separator = QFrame()
+            cat_separator.setObjectName("DottedSeparator")
+            cat_separator.setFixedHeight(1)
+            layout.addWidget(cat_separator, row, 0, 1, 2)
+            row += 1
+
+            label = QLabel(label_text + ":")
+            label.setObjectName("MetricTitle")
+            label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+
+            options_widget = QWidget()
+            options_layout = QVBoxLayout(options_widget)
+            options_layout.setContentsMargins(0, 0, 0, 0)
+            options_layout.setSpacing(4)
+            group = QButtonGroup(options_widget)
+
+            buttons: dict[str | None, QRadioButton] = {}
+            none_button = QRadioButton(_SIN_ESPECIFICAR)
+            group.addButton(none_button)
+            options_layout.addWidget(none_button)
+            buttons[None] = none_button
+            for option in CATEGORY_OPTIONS[key]:
+                button = QRadioButton(option)
+                group.addButton(button)
+                options_layout.addWidget(button)
+                buttons[option] = button
+
+            layout.addWidget(label, row, 0)
+            layout.addWidget(options_widget, row, 1)
+            self._new_radio_buttons[key] = buttons
+            row += 1
+
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+        cancel_button = QPushButton("Cancelar")
+        cancel_button.setObjectName("LinkButton")
+        cancel_button.clicked.connect(lambda: self.back_button.click())
+        button_row.addWidget(cancel_button)
+        self.create_button = QPushButton("Crear proyecto")
+        self.create_button.setObjectName("PrimaryButton")
+        self.create_button.clicked.connect(self._on_create_clicked)
+        button_row.addWidget(self.create_button)
+        layout.addLayout(button_row, row, 0, 1, 2)
+
+        content_layout.addWidget(form_panel)
+        content_layout.addStretch()
+
+        content_scroll = QScrollArea()
+        content_scroll.setWidgetResizable(True)
+        content_scroll.setFrameShape(QFrame.NoFrame)
+        content_scroll.setWidget(content_widget)
+        outer.addWidget(content_scroll, 1)
+
+    def reset(self) -> None:
+        """Blank every field, called each time the page is opened —
+        otherwise the previous project's now-created data would still
+        be sitting in the form."""
+        latest_year = YEARS_WITH_DATA[-1]
+        for year_str, button in self._year_buttons.items():
+            button.setChecked(year_str == latest_year)
+        for field in self._new_inputs.values():
+            field.clear()
+        for field in self._new_multiline.values():
+            field.clear()
+        for buttons in self._new_radio_buttons.values():
+            buttons[None].setChecked(True)
+        self._new_inputs["project_name"].setFocus()
+
+    def _on_create_clicked(self) -> None:
+        year_str = next(
+            (y for y, button in self._year_buttons.items() if button.isChecked()), None
+        )
+        if year_str is None:
+            QMessageBox.warning(self, "Falta el año", "Elige a qué año pertenece el proyecto.")
+            return
+
+        values: dict[str, str | None] = {}
+        for _label, key in EDIT_TEXT_FIELDS:
+            values[key] = self._new_inputs[key].text().strip() or None
+        for _label, key in EDIT_MULTILINE_FIELDS:
+            values[key] = self._new_multiline[key].toPlainText().strip() or None
+        for _label, key in EDIT_CATEGORY_FIELDS:
+            selected = None
+            for value, button in self._new_radio_buttons[key].items():
+                if button.isChecked():
+                    selected = value
+                    break
+            values[key] = selected
+
+        try:
+            new_row = data_service.create_project_info(int(year_str), values)
+        except Exception as exc:
+            QMessageBox.critical(self, "No se pudo crear el proyecto", str(exc))
+            return
+
+        self.project_created.emit(new_row["id"])
 
 
 class TimelineWidget(QWidget):
@@ -1254,6 +1863,7 @@ class MainWindow(QMainWindow):
         self.ofertas_page = OfertasPage()
         self.project_page = ProjectDetailPage()
         self.proyectos_info_detail_page = ProyectosInfoDetailPage()
+        self.proyectos_info_new_page = ProyectosInfoNewPage()
         for page in (
             self.projects_page,
             self.proyectos_info_page,
@@ -1261,6 +1871,7 @@ class MainWindow(QMainWindow):
             self.ofertas_page,
             self.project_page,
             self.proyectos_info_detail_page,
+            self.proyectos_info_new_page,
         ):
             self.stack.addWidget(page)
         main.addWidget(self.stack, 1)
@@ -1285,6 +1896,15 @@ class MainWindow(QMainWindow):
         self.proyectos_info_detail_page.back_button.clicked.connect(
             lambda: self._navigate(self._project_info_return_index)
         )
+        self.proyectos_info_page.new_project_requested.connect(self.open_new_project)
+        self.proyectos_info_new_page.back_button.clicked.connect(
+            lambda: self._navigate(self._project_info_return_index)
+        )
+        # A freshly created project opens straight into its own detail
+        # page rather than back to the list, so its own "Volver" needs
+        # to be told to go back to the LIST (not back to the now-stale
+        # Nuevo proyecto form) — see open_new_project_result.
+        self.proyectos_info_new_page.project_created.connect(self.open_new_project_result)
 
         self._navigate(0)
         self.refresh_all()
@@ -1365,6 +1985,7 @@ class MainWindow(QMainWindow):
         3: ("Ofertas", "Documentos Firmado y Pedido dentro de FACTURACION/INGEVIA en 02.-GESTIÓN"),
         4: ("Proyecto", ""),
         5: ("Proyecto Info", ""),
+        6: ("Nuevo proyecto", "Añade una fila nueva a uno de los archivos 2024/2025/2026"),
     }
 
     def _navigate(self, index: int) -> None:
@@ -1390,6 +2011,21 @@ class MainWindow(QMainWindow):
 
     def open_project_info(self, item_id: int) -> None:
         self._project_info_return_index = self.stack.currentIndex()
+        self.proyectos_info_detail_page.load(item_id)
+        self._navigate(5)
+
+    def open_new_project(self) -> None:
+        self._project_info_return_index = self.stack.currentIndex()
+        self.proyectos_info_new_page.reset()
+        self._navigate(6)
+
+    def open_new_project_result(self, item_id: int) -> None:
+        # Deliberately NOT open_project_info() — that would set the
+        # return index to the Nuevo proyecto form (index 6, the current
+        # page when this fires), so "Volver" on the detail page would
+        # land back on a stale, already-submitted form instead of the
+        # list. Always go back to the list itself here.
+        self._project_info_return_index = 1
         self.proyectos_info_detail_page.load(item_id)
         self._navigate(5)
 
