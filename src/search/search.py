@@ -194,7 +194,8 @@ def search_folders(
 
     rows = conn.execute(
         f"""
-        SELECT f.id, f.name, f.path, f.company_project, f.year, f.location_site, f.source
+        SELECT f.id, f.name, f.path, f.company_project, f.year, f.location_site, f.source,
+               f.job_code, f.site_code
         FROM folders f
         WHERE {where_sql}
         LIMIT ?
@@ -210,6 +211,14 @@ def search_folders(
             "year": r[4],
             "location_site": r[5],
             "source": r[6],
+            # The crawler's own parsed project code (e.g. "22-007") and,
+            # when this folder is a specific site under that job,
+            # site_code (e.g. "22-007-02") — exposed so the UI can offer
+            # to jump straight to this folder's matching row(s) in
+            # Proyectos Info, matched against NUMERO DE PROYECTO there
+            # (see data_service.find_project_info_by_job_code).
+            "job_code": r[7],
+            "site_code": r[8],
         }
         for r in rows
     ]

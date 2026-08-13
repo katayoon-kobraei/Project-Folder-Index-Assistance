@@ -278,7 +278,18 @@ class SearchPage(QWidget):
     searches project canonical names — that's what the Proyectos page's
     own filter is for. All three inputs (text, year, company) narrow the
     same two result sets together; both stay empty until at least one of
-    them is actually set."""
+    them is actually set.
+
+    Each folder row also has a "Proyectos Info" button — the crawler
+    already parses a job_code/site_code per folder (e.g. "22-007" /
+    "22-007-02", same "YY-NNN..." numbering as NUMERO DE PROYECTO in the
+    Proyectos Info workbook), so clicking it looks up the matching
+    row(s) there (see data_service.find_project_info_by_job_code) and
+    opens that project's detail card directly — the same page with the
+    category radio pickers — without having to go hunt for it by
+    company name on the Proyectos Info page."""
+
+    project_info_requested = Signal(int)
 
     def __init__(self) -> None:
         super().__init__()
@@ -330,8 +341,10 @@ class SearchPage(QWidget):
         self.count_label.setObjectName("MutedText")
         outer.addWidget(self.count_label)
 
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Carpeta", "Proyecto", "Año", "Ubicación", "Ruta"])
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(
+            ["", "Carpeta", "Proyecto", "Año", "Ubicación", "Ruta"]
+        )
         configure_table(self.table)
         self._set_fixed_result_column_widths(self.table)
         # Ruta needs to show the FULL path, even past the edge of the
@@ -378,15 +391,17 @@ class SearchPage(QWidget):
 
     @staticmethod
     def _set_fixed_result_column_widths(table: QTableWidget) -> None:
-        # Fixed widths for the middle columns, set ONCE rather than
-        # recomputed from cell contents on every keystroke — the one
-        # column each table needs shown in FULL (Ruta / Archivo) is
-        # separately sized to its actual content in _render()/
-        # _render_files() instead, which is cheap for a single column.
-        table.setColumnWidth(0, 260)
-        table.setColumnWidth(1, 200)
-        table.setColumnWidth(2, 60)
-        table.setColumnWidth(3, 160)
+        # Fixed widths for the icon-button column and the middle
+        # columns, set ONCE rather than recomputed from cell contents on
+        # every keystroke — the one column each table needs shown in
+        # FULL (Ruta / Archivo) is separately sized to its actual
+        # content in _render()/_render_files() instead, which is cheap
+        # for a single column.
+        table.setColumnWidth(0, 40)
+        table.setColumnWidth(1, 260)
+        table.setColumnWidth(2, 200)
+        table.setColumnWidth(3, 60)
+        table.setColumnWidth(4, 160)
 
     def _load_years(self) -> None:
         if self._years_loaded:
@@ -443,16 +458,29 @@ class SearchPage(QWidget):
         self.table.setUpdatesEnabled(False)
         self.table.setRowCount(total)
         for row_idx, folder in enumerate(self._rows):
-            self.table.setItem(row_idx, 0, QTableWidgetItem(folder["name"]))
-            self.table.setItem(row_idx, 1, QTableWidgetItem(folder.get("company_project") or ""))
-            self.table.setItem(row_idx, 2, QTableWidgetItem(str(folder.get("year") or "?")))
-            self.table.setItem(row_idx, 3, QTableWidgetItem(folder.get("location_site") or ""))
-            self.table.setItem(row_idx, 4, QTableWidgetItem(folder["path"]))
+            # Icon button first, same column-0 placement and style as
+            # the Archivos table's "open containing folder" button below.
+            pi_button = QPushButton("ℹ️")
+            pi_button.setObjectName("LinkButton")
+            pi_button.setCursor(Qt.PointingHandCursor)
+            pi_button.setToolTip(
+                "Buscar y abrir la ficha de este proyecto en Proyectos Info"
+            )
+            pi_button.clicked.connect(
+                lambda checked=False, i=row_idx: self._open_project_info_for_folder(i)
+            )
+            self.table.setCellWidget(row_idx, 0, pi_button)
+
+            self.table.setItem(row_idx, 1, QTableWidgetItem(folder["name"]))
+            self.table.setItem(row_idx, 2, QTableWidgetItem(folder.get("company_project") or ""))
+            self.table.setItem(row_idx, 3, QTableWidgetItem(str(folder.get("year") or "?")))
+            self.table.setItem(row_idx, 4, QTableWidgetItem(folder.get("location_site") or ""))
+            self.table.setItem(row_idx, 5, QTableWidgetItem(folder["path"]))
         # Only this one column, not resizeColumnsToContents() for all
-        # five — measuring just the path column is a few ms even at 300
+        # six — measuring just the path column is a few ms even at 300
         # rows (confirmed), vs. the near-hang measuring every column
         # caused earlier when it ran on every keystroke.
-        self.table.resizeColumnToContents(4)
+        self.table.resizeColumnToContents(5)
         self.table.setUpdatesEnabled(True)
 
     def _render_files(self) -> None:
@@ -513,6 +541,45 @@ class SearchPage(QWidget):
         if 0 <= row_idx < len(self._file_rows):
             folder = containing_folder(self._file_rows[row_idx]["path"])
             self._open_path(folder, "la carpeta")
+
+    def _open_project_info_for_folder(self, row_idx: int) -> None:
+        if not (0 <= row_idx < len(self._rows)):
+            return
+        folder = self._rows[row_idx]
+        # Prefer site_code (more specific, e.g. "22-007-02") when this
+        # folder is itself a specific site; fall back to job_code (the
+        # whole project, e.g. "22-007") otherwise.
+        code = folder.get("site_code") or folder.get("job_code")
+        if not code:
+            QMessageBox.information(
+                self,
+                "Sin código de proyecto",
+                "Esta carpeta no tiene un código de proyecto reconocido (formato "
+                "AA-NNN), así que no se puede relacionar automáticamente con "
+                "Proyectos Info.",
+            )
+            return
+        try:
+            matches = data_service.find_project_info_by_job_code(code, folder.get("year"))
+        except Exception as exc:
+            QMessageBox.critical(self, "Error al buscar en Proyectos Info", str(exc))
+            return
+        if not matches:
+            QMessageBox.information(
+                self,
+                "Sin coincidencias",
+                f'No se encontró ningún proyecto con el código "{code}" en Proyectos Info.',
+            )
+            return
+        if len(matches) > 1:
+            QMessageBox.information(
+                self,
+                "Varias coincidencias",
+                f'{len(matches)} filas de Proyectos Info coinciden con el código "{code}". '
+                "Se abre la primera — usa el botón Volver y la página Proyectos Info "
+                "para ver las demás.",
+            )
+        self.project_info_requested.emit(matches[0]["id"])
 
 
 STATUS_COLORS = {"Firmado": "#0F6E56", "Pedido": "#B45309"}
@@ -2001,6 +2068,11 @@ class MainWindow(QMainWindow):
         self.proyectos_info_detail_page.back_button.clicked.connect(self._go_back)
         self.proyectos_info_page.new_project_requested.connect(self.open_new_project)
         self.proyectos_info_new_page.back_button.clicked.connect(self._go_back)
+        # Buscar's "Proyectos Info" button on a folder result — reuses
+        # open_project_info, so "Volver" on the detail page correctly
+        # returns to Buscar (index 2), same nav-stack mechanism as
+        # every other entry point into that page.
+        self.search_page.project_info_requested.connect(self.open_project_info)
         # A freshly created project opens straight into its own detail
         # page rather than back to the form — see open_new_project_result.
         self.proyectos_info_new_page.project_created.connect(self.open_new_project_result)

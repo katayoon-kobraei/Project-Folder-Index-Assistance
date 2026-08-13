@@ -203,6 +203,31 @@ def project_info_detail(item_id: int) -> dict | None:
     return None
 
 
+def find_project_info_by_job_code(job_code: str, preferred_year: int | None = None) -> list[dict]:
+    """Every project_info row whose NUMERO DE PROYECTO starts with
+    `job_code` — the join key between a folder found in Buscar (its
+    crawled job_code/site_code, e.g. "22-007" or "22-007-02", see
+    search_folders) and its matching row(s) in Proyectos Info, since
+    both use the same "YY-NNN..." numbering. A PREFIX match, not exact:
+    the xlsx often appends a per-document suffix the folder's own code
+    doesn't have (folder "24-001" should still match rows numbered
+    "24-001-01", "24-001-02", ...). Rows from `preferred_year` (the
+    folder's own crawled year, when known) sort first, since that's a
+    strong hint for which of possibly several same-prefix matches is
+    the right one — every match is still returned, not just that
+    year's, so the caller can tell the two cases apart."""
+    job_code = (job_code or "").strip()
+    if not job_code:
+        return []
+    matches = [
+        row for row in project_info_rows()
+        if (row.get("project_number") or "").strip().startswith(job_code)
+    ]
+    if preferred_year is not None:
+        matches.sort(key=lambda r: r["year"] != preferred_year)
+    return matches
+
+
 def update_project_info(item_id: int, updates: dict) -> dict:
     """Save edits from the Editar form for one project_info row straight
     into its source cell (see src/project_info/writer.py — only that one
