@@ -3,20 +3,23 @@ Reads (and, via writer.py, edits) the "LISTADO PROYECTOS POR AÑOS"
 workbook that backs the Proyectos Info page — a hand-maintained Excel
 file, NOT the crawled P: index.
 
-The real source is a single multi-sheet workbook (one sheet per year),
-but the app reads from a FOLDER of separate single-sheet files instead —
-one per year, named "2024.xlsx", "2025.xlsx", "2026.xlsx" — produced by
-split_workbook_by_year() below (also runnable as
-scripts/split_project_info_by_year.py). Only 2024, 2025, and 2026
-currently have real data, so those are the only files ever read; a
-folder missing one of the three still works fine with whichever are
-present. As of the latest real files, each year sheet has a smaller set
-of columns than earlier versions did (NUMERO DE PROYECTO, PLANNING,
-NOMBRE, LISTADO DE EMPLEADOS, TRABAJOS A REALIZAR, TITULO ENTERO DEL
-PROYECTO, CIUDAD, PROVINCIA, FECHA DEL PROYECTO, PROMOTOR, TIPO,
-SUBTIPO1, SUBTIPO2) — older/fuller columns (budgets, KPIs, visado, etc.)
-are still supported below for backwards compatibility with any file that
-still has them, they just won't appear if the column is gone.
+The real source is a single multi-sheet workbook (one sheet per year,
+2008 through 2026 — 2012 and 2013 share one combined "2012-2013" sheet
+in the source, see _COMBINED_YEAR_SHEETS), but the app reads from a
+FOLDER of separate single-sheet files instead — one per year, named
+"2008.xlsx" through "2026.xlsx" — produced by split_workbook_by_year()
+below (also runnable as scripts/split_project_info_by_year.py). A
+folder missing some of those years still works fine with whichever are
+present (see YEARS_WITH_DATA).
+
+The workbook's schema changed twice over that span, and _rows_from_sheet
+below auto-detects both the header ROW (row 1 for 2019 onward; row 4 for
+2008-2018, which have a couple of metadata/spacer rows above the header)
+and, as always, matches columns by NAME rather than position, so neither
+shift needs special-casing beyond that. The 2008-2018 sheets are missing
+TRABAJOS A REALIZAR (2018 has it) and LISTADO DE EMPLEADOS (added only in
+2026); a column that's simply absent from a given year's sheet comes
+back as None for every row in that file rather than erroring.
 
 FIELD_MAP below is the single source of truth for both directions:
 reading a cell into a row dict (load_project_info) AND writing an edited
@@ -58,9 +61,24 @@ from pathlib import Path
 
 import openpyxl
 
-YEARS_WITH_DATA = ("2024", "2025", "2026")
+YEARS_WITH_DATA = tuple(str(y) for y in range(2008, 2027))
 
 _REQUIRED_HEADERS = ("NOMBRE",)
+
+# The master workbook keeps 2012 and 2013 in one combined sheet named
+# "2012-2013" instead of two separate ones — split_workbook_by_year()
+# still produces separate 2012.xlsx/2013.xlsx from it, by reading the
+# first two digits of NUMERO DE PROYECTO ("12-036" -> 2012, "13-CON 001"
+# -> 2013). Verified against the real file: every one of that sheet's 75
+# rows starts cleanly with "12" or "13", no ambiguous ones.
+_COMBINED_YEAR_SHEETS = {"2012": "2012-2013", "2013": "2012-2013"}
+
+# How many rows from the top to scan for the real header row. The
+# 2008-2018 sheets have 2-3 metadata/spacer rows above it (e.g. a
+# "CALCULO DE SUMATORIO DE CELDAS POR COLORES" formula-summary row),
+# landing the header on row 4; 2019 onward it's row 1. 10 is comfortably
+# more than either needs.
+_HEADER_SCAN_ROWS = 10
 
 # (header text in the sheet, field key, is this a date column?). Order
 # here doesn't matter for parsing (headers are matched by name, not
@@ -150,8 +168,15 @@ def _cell(row_values: dict, header: str):
 
 
 def _company_from_name(project_name: str) -> str:
-    if " - " in project_name:
-        return project_name.split(" - ", 1)[0].strip()
+    # Split on the FIRST "-" character, whatever the spacing around it —
+    # real NOMBRE entries are inconsistent ("PLENOIL - X", "PLENOIL- X",
+    # "PLENOIL -X", "PLENOIL-X" all appear for the same client), so a
+    # strict " - " match misses most of them. A bare split-and-strip on
+    # the first "-" groups all of those together correctly, since the
+    # separator dash always comes before any dashes inside the rest of
+    # the name (e.g. "SEINZA - CV-310 NAQUERA" -> "SEINZA").
+    if "-" in project_name:
+        return project_name.split("-", 1)[0].strip()
     return project_name.strip()
 
 
@@ -160,13 +185,35 @@ def _join_nonempty(*parts: str | None, sep: str = " / ") -> str | None:
     return sep.join(values) if values else None
 
 
+def _find_header_row(ws) -> int:
+    """1-based row number of the sheet's real header row — the first row
+    (within the first _HEADER_SCAN_ROWS) containing at least one of
+    _REQUIRED_HEADERS. Falls back to row 1 if none is found in range, so
+    a sheet that isn't a project table at all behaves the same as
+    before (load_project_info's own NOMBRE-column check rejects it
+    right after this)."""
+    for row_number, row in enumerate(
+        ws.iter_rows(min_row=1, max_row=_HEADER_SCAN_ROWS, values_only=True), start=1
+    ):
+        cleaned = {c.strip() if isinstance(c, str) else c for c in row}
+        if any(h in cleaned for h in _REQUIRED_HEADERS):
+            return row_number
+    return 1
+
+
 def _rows_from_sheet(ws) -> tuple[list, list[list]]:
-    """(headers, raw_data_rows) — headers from row 1 (stripped strings),
-    every row from row 2 on as a list of raw cell values, in sheet
-    order."""
-    header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+    """(headers, raw_data_rows) — headers from the sheet's real header
+    row (see _find_header_row: row 1 for 2019 onward, row 4 for the
+    2008-2018 sheets), stripped strings; every row below that as a list
+    of raw cell values, in sheet order."""
+    header_row_number = _find_header_row(ws)
+    header_row = next(
+        ws.iter_rows(min_row=header_row_number, max_row=header_row_number, values_only=True)
+    )
     headers = [h.strip() if isinstance(h, str) else h for h in header_row]
-    data_rows = [list(r) for r in ws.iter_rows(min_row=2, values_only=True)]
+    data_rows = [
+        list(r) for r in ws.iter_rows(min_row=header_row_number + 1, values_only=True)
+    ]
     return headers, data_rows
 
 
@@ -174,22 +221,38 @@ def _row_dict_from_raw(
     headers: list, raw_row: list, year: int, next_id: int, row_number: int
 ) -> dict | None:
     """Build one normalized row dict from a raw (headers, row) pair, or
-    None if this row has no NOMBRE (a blank spacer row). `row_number` is
-    the row's actual 1-based position in the worksheet (header is row 1,
-    so the first data row is 2) — carried along so writer.py can find
-    this exact cell again later without re-matching by content."""
+    None if this row has neither a NOMBRE nor a fallback title (a blank
+    spacer row). `row_number` is the row's actual 1-based position in
+    the worksheet (header is row 1, so the first data row is 2) —
+    carried along so writer.py can find this exact cell again later
+    without re-matching by content.
+
+    2008, 2010, and about half of the combined 2012-2013 sheet never
+    filled in NOMBRE at all — every row there only has the long
+    descriptive TITULO ENTERO DEL PROYECTO text (verified against the
+    real file: 0 of 209 rows in 2008 have a NOMBRE, all 209 have a
+    TITULO). Falling back to that title as the effective project_name
+    is what makes those years show up at all instead of silently
+    vanishing; it deliberately ends up identical to full_title in that
+    case, which is a faithful (if repetitive) reflection of what the
+    source sheet actually has, not a bug. Editing "Nombre" for one of
+    these through the app writes a real NOMBRE value going forward."""
     row_values = {
         headers[i]: raw_row[i]
         for i in range(min(len(headers), len(raw_row)))
         if headers[i]
     }
-    project_name = _cell(row_values, "NOMBRE")
+    project_name = _cell(row_values, "NOMBRE") or _cell(row_values, "TITULO ENTERO DEL PROYECTO")
     if not project_name:
         return None
 
     result = {"id": next_id, "year": year, "row_number": row_number}
     for header, key, is_date in FIELD_MAP:
         result[key] = _format_date(row_values.get(header)) if is_date else _cell(row_values, header)
+    # Override with the resolved value (real NOMBRE, or the TITULO
+    # fallback above) — the FIELD_MAP loop just set this straight from
+    # the (possibly blank) NOMBRE cell.
+    result["project_name"] = project_name
 
     result["company"] = _company_from_name(project_name)
     city, province = result.get("city"), result.get("province")
@@ -201,12 +264,13 @@ def _row_dict_from_raw(
 def split_workbook_by_year(source_path: str, output_dir: str) -> list[str]:
     """One-time conversion: read the master multi-sheet workbook at
     `source_path` and write a separate single-sheet workbook per year
-    (only for years in YEARS_WITH_DATA that actually have a sheet in the
-    source) into `output_dir`, named "2024.xlsx" / "2025.xlsx" /
-    "2026.xlsx" — an exact copy of that year's header row + every data
-    row, same order, same cell types (dates stay real dates). Returns
-    the list of file paths written. Safe to re-run any time the master
-    workbook is updated — each run overwrites the same 3 files."""
+    (only for years in YEARS_WITH_DATA that actually have a sheet — or,
+    for 2012/2013, a combined sheet, see _COMBINED_YEAR_SHEETS — in the
+    source) into `output_dir`, named "2008.xlsx" through "2026.xlsx" —
+    an exact copy of that year's header row + every data row, same
+    order, same cell types (dates stay real dates). Returns the list of
+    file paths written. Safe to re-run any time the master workbook is
+    updated — each run overwrites the same files."""
     if not Path(source_path).exists():
         raise FileNotFoundError(f"No se encuentra el archivo origen: {source_path}")
 
@@ -215,9 +279,26 @@ def split_workbook_by_year(source_path: str, output_dir: str) -> list[str]:
     try:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         for year_str in YEARS_WITH_DATA:
-            if year_str not in wb.sheetnames:
+            sheet_name = year_str if year_str in wb.sheetnames else _COMBINED_YEAR_SHEETS.get(year_str)
+            if sheet_name is None or sheet_name not in wb.sheetnames:
                 continue
-            headers, data_rows = _rows_from_sheet(wb[year_str])
+            headers, data_rows = _rows_from_sheet(wb[sheet_name])
+
+            if sheet_name != year_str:
+                # Combined sheet — keep only this year's rows, picked
+                # out by the NUMERO DE PROYECTO prefix (see
+                # _COMBINED_YEAR_SHEETS).
+                num_col = next(
+                    (i for i, h in enumerate(headers) if h == "NUMERO DE PROYECTO"), None
+                )
+                year_suffix = year_str[2:]  # "12" or "13"
+                if num_col is not None:
+                    data_rows = [
+                        row for row in data_rows
+                        if num_col < len(row)
+                        and isinstance(row[num_col], str)
+                        and row[num_col].strip().startswith(year_suffix)
+                    ]
 
             out_wb = openpyxl.Workbook()
             out_ws = out_wb.active
@@ -237,13 +318,13 @@ def split_workbook_by_year(source_path: str, output_dir: str) -> list[str]:
 
 def load_project_info(dir_path: str) -> list[dict]:
     """Read every project row from the per-year workbook files
-    ("2024.xlsx", "2025.xlsx", "2026.xlsx" — see split_workbook_by_year)
-    inside `dir_path`. Whichever of the three files actually exist are
-    read; a missing one is skipped rather than treated as an error,
-    since the source data itself only covers these years and even that
-    coverage may be incomplete at any given time. Raises
-    FileNotFoundError only if the directory itself is missing, or none
-    of the three expected files are present at all.
+    ("2008.xlsx" through "2026.xlsx" — see split_workbook_by_year and
+    YEARS_WITH_DATA) inside `dir_path`. Whichever of those files
+    actually exist are read; a missing one is skipped rather than
+    treated as an error, since the source data's own year coverage may
+    be incomplete at any given time. Raises FileNotFoundError only if
+    the directory itself is missing, or none of the expected files are
+    present at all.
 
     Returns a list of dicts, each with a stable `id` (its position in
     this combined list, in the SAME order the rows appear in the sheets

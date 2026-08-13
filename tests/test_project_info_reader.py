@@ -24,6 +24,7 @@ HEADERS = [
     "PRESUPUESTO EN Nº\nEJECUCIÓN MATERIAL", "NOTAS", "FIRMADO",
     "FECHA DE LA FIRMA", "VISADO", "NUMERO DE EXPEDIENTE", "FECHA DEL VISADO",
     "COMIENZO DE LA OBRA", "FIN DE LA OBRA", "IMPORTE DEL CONTRATO",
+    "LISTADO DE EMPLEADOS",
 ]
 
 
@@ -86,6 +87,7 @@ def test_load_project_info_maps_known_columns(tmp_path):
         "FECHA DEL VISADO": datetime.datetime(2024, 6, 10),
         "COMIENZO DE LA OBRA": datetime.datetime(2024, 7, 1),
         "IMPORTE DEL CONTRATO": 99999,
+        "LISTADO DE EMPLEADOS": "Juan Pérez, María López",
     }])
 
     rows = load_project_info(str(tmp_path))
@@ -113,13 +115,45 @@ def test_load_project_info_maps_known_columns(tmp_path):
     assert r["contract_amount"] == "99999"
     assert r["start_date"] == "01/06/2024"
     assert r["deadline"] is None
-    assert r["employees_assigned"] is None
+    assert r["employee_list"] == "Juan Pérez, María López"
+
+
+def test_load_project_info_employee_list_none_when_column_absent(tmp_path):
+    # Real-world case: a year file that predates the "LISTADO DE
+    # EMPLEADOS" column being added — must come through as None, not
+    # crash or KeyError.
+    _make_year_file(tmp_path, "2025", [{"NOMBRE": "SIN COLUMNA DE EMPLEADOS"}])
+    rows = load_project_info(str(tmp_path))
+    assert rows[0]["employee_list"] is None
 
 
 def test_load_project_info_derives_company_without_dash(tmp_path):
     _make_year_file(tmp_path, "2025", [{"NOMBRE": "SOLO NOMBRE SIN GUION"}])
     rows = load_project_info(str(tmp_path))
     assert rows[0]["company"] == "SOLO NOMBRE SIN GUION"
+
+
+def test_load_project_info_groups_company_regardless_of_dash_spacing(tmp_path):
+    # Real NOMBRE data is inconsistent about spacing around the "-" that
+    # separates company from site — all four of these must resolve to
+    # the same "PLENOIL" grouping key, not just the one with spaces on
+    # both sides.
+    _make_year_file(tmp_path, "2026", [
+        {"NOMBRE": "PLENOIL - TETUAN 2 GANDIA"},
+        {"NOMBRE": "PLENOIL- AVDA GENERALITAT MASSANASSA"},
+        {"NOMBRE": "PLENOIL -CTRA DEL MIG 36 HOSPITALET"},
+        {"NOMBRE": "PLENOIL-CTRA NACIONAL 340"},
+    ])
+    rows = load_project_info(str(tmp_path))
+    assert [r["company"] for r in rows] == ["PLENOIL"] * 4
+
+
+def test_load_project_info_company_only_splits_on_first_dash(tmp_path):
+    # "SEINZA - CV-310 NAQUERA" has a second "-" inside the site code
+    # itself (CV-310) — the company must come from the FIRST dash only.
+    _make_year_file(tmp_path, "2026", [{"NOMBRE": "SEINZA - CV-310 NAQUERA"}])
+    rows = load_project_info(str(tmp_path))
+    assert rows[0]["company"] == "SEINZA"
 
 
 def test_load_project_info_skips_blank_spacer_rows(tmp_path):

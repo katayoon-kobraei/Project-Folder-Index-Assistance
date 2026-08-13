@@ -800,20 +800,27 @@ def _make_status_pill(status: str | None) -> QLabel:
 
 
 class ProyectosInfoPage(QWidget):
-    """Year -> project hierarchy read from the hand-maintained 'LISTADO
+    """Year -> company hierarchy read from the hand-maintained 'LISTADO
     PROYECTOS POR AÑOS' workbook (project_info_path in config.yaml) — a
     completely separate data source from the crawled P: index the rest
-    of the app uses. Only 2024, 2025, and 2026 currently have real data
-    in that file (see src/project_info/reader.py), so those are the only
-    years that can ever appear here. The list shows each project's raw
-    NOMBRE value exactly as it reads in the workbook (no derived company
-    prefix), its TITULO ENTERO DEL PROYECTO (blank if the row has none),
-    and its PLANNING status as a small colored pill (every 2024-2026 row
-    has this filled in) — clicking a row opens its own detail card
-    (ProyectosInfoDetailPage), not a table."""
+    of the app uses. Whichever years reader.YEARS_WITH_DATA lists (2008
+    through 2026, as of the last split from the master workbook) are the
+    only ones that can ever appear here.
 
-    project_info_opened = Signal(int)
+    Every row under a year is a company node (row["company"] — the text
+    before the first "-" in NOMBRE, or the whole name if there's none),
+    always, even a company with only one row — there's no more "skip the
+    wrapper for a singleton" special case, so the list here is uniform:
+    year -> company -> (a separate page). Double-clicking a company node
+    doesn't expand it in place; it navigates to ProyectosInfoCompanyPage,
+    which lists that company's rows for that year and is where
+    double-clicking an individual row opens its own detail card
+    (ProyectosInfoDetailPage)."""
+
+    company_opened = Signal(int, str)  # (year, company)
     new_project_requested = Signal()
+
+    _ALL_YEARS_LABEL = "Todos los años"
 
     def __init__(self) -> None:
         super().__init__()
@@ -834,17 +841,28 @@ class ProyectosInfoPage(QWidget):
         outer.addLayout(heading_row)
 
         subtitle = QLabel(
-            "Datos del archivo Excel de proyectos (2024, 2025 y 2026 — únicos años "
-            "con datos disponibles). Haz doble clic en un proyecto para ver su ficha."
+            f"Datos del archivo Excel de proyectos ({YEARS_WITH_DATA[0]}-{YEARS_WITH_DATA[-1]}), "
+            "agrupados por empresa/cliente. Haz doble clic en una empresa para ver "
+            "sus proyectos."
         )
         subtitle.setObjectName("MutedText")
         subtitle.setWordWrap(True)
         outer.addWidget(subtitle)
 
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(10)
         self.filter_box = QLineEdit()
         self.filter_box.setPlaceholderText("Filtrar por nombre de proyecto...")
         self.filter_box.textChanged.connect(self._on_filter_changed)
-        outer.addWidget(self.filter_box)
+        filter_row.addWidget(self.filter_box, 1)
+
+        self.year_filter = QComboBox()
+        self.year_filter.addItem(self._ALL_YEARS_LABEL)
+        self.year_filter.addItems(list(reversed(YEARS_WITH_DATA)))  # newest first, matches the tree
+        self.year_filter.setMinimumWidth(130)
+        self.year_filter.currentIndexChanged.connect(self._apply_filter)
+        filter_row.addWidget(self.year_filter)
+        outer.addLayout(filter_row)
 
         # Filtering just show/hides existing rows (see _apply_filter) —
         # cheap — but debounced anyway so a fast typist doesn't trigger
@@ -922,7 +940,17 @@ class ProyectosInfoPage(QWidget):
         internal layout bookkeeping on every single insertion, which
         gets quadratically worse as the list grows. Building the whole
         subtree off-tree first and attaching it in one shot avoids that
-        entirely — same end result, a small fraction of the time."""
+        entirely — same end result, a small fraction of the time.
+
+        Within each year, rows are grouped by "company" — reader.py's
+        row["company"], the text before the first "-" in NOMBRE (or the
+        whole name if there's no "-"). Every company becomes exactly one
+        leaf item under its year, shown as "COMPANY (n)" — always, even
+        when n is 1, so the list is uniform regardless of how many rows
+        a company has. There's no in-place expansion any more: each
+        company item carries (year, company) via setData, and double-
+        clicking it navigates to ProyectosInfoCompanyPage instead (see
+        _on_item_double_clicked / company_opened)."""
         self.tree.setUpdatesEnabled(False)
         self.tree.clear()
 
@@ -931,9 +959,10 @@ class ProyectosInfoPage(QWidget):
             self.tree.setUpdatesEnabled(True)
             return
 
-        by_year: dict[int, list[dict]] = {}
+        by_year: dict[int, dict[str, list[dict]]] = {}
         for row in self._rows:
-            by_year.setdefault(row["year"], []).append(row)
+            company = row.get("company") or row["project_name"] or ""
+            by_year.setdefault(row["year"], {}).setdefault(company, []).append(row)
 
         year_items = []
         for year in sorted(by_year.keys(), reverse=True):
@@ -941,31 +970,24 @@ class ProyectosInfoPage(QWidget):
             bold_font = year_item.font(0)
             bold_font.setBold(True)
             year_item.setFont(0, bold_font)
-            pills = []
-            # NOT re-sorted — kept in the same order the rows appear in
-            # the source spreadsheet (by_year[year] is already in that
-            # order, since reader.py appends rows as it reads them and
-            # never sorts). The sheet's own order is meaningful: several
-            # rows can share one project name, each representing a
-            # different document/task for it, in a specific sequence.
-            for row in by_year[year]:
-                # Column 0 is left blank in the item's own text — the
-                # status pill widget sits there instead (see
-                # setItemWidget below). Column 0 also still carries the
-                # row's id via setData, independent of what's visibly
-                # shown there. Column 1's text (Proyecto) also doubles
-                # as what _apply_filter() matches against.
-                child = QTreeWidgetItem(
-                    year_item, ["", row["project_name"] or "", row.get("full_title") or ""]
+            # NOT re-sorted — companies appear in the order their first
+            # row shows up in the source spreadsheet (by_year[year] is
+            # built by iterating self._rows in read order, and dicts
+            # preserve insertion order).
+            for company, company_rows in by_year[year].items():
+                # Column 0 (Estado) is intentionally blank here — a
+                # company can span several different statuses, so no
+                # single pill would be accurate; per-row status is shown
+                # on the company page instead. Column 1's text also
+                # doubles as what _apply_filter() matches against.
+                company_item = QTreeWidgetItem(
+                    year_item, ["", f"{company} ({len(company_rows)})", ""]
                 )
-                child.setData(0, Qt.UserRole, row["id"])
-                pills.append((child, row.get("status")))
-            year_items.append((year_item, pills))
+                company_item.setData(0, Qt.UserRole, (year, company))
+            year_items.append(year_item)
 
-        self.tree.addTopLevelItems([year_item for year_item, _pills in year_items])
-        for year_item, pills in year_items:
-            for child, status in pills:
-                self.tree.setItemWidget(child, 0, _make_status_pill(status))
+        self.tree.addTopLevelItems(year_items)
+        for year_item in year_items:
             year_item.setExpanded(True)
 
         self.tree.resizeColumnToContents(1)
@@ -978,15 +1000,20 @@ class ProyectosInfoPage(QWidget):
 
     def _apply_filter(self) -> None:
         """Shows/hides the tree's EXISTING items to match the filter box
-        — no items are created or destroyed here, which is what keeps
-        this fast enough to run on every keystroke (after the debounce)
-        even with several hundred rows."""
+        and the year dropdown — no items are created or destroyed here,
+        which is what keeps this fast enough to run on every keystroke
+        (after the debounce) even with several thousand rows across 19
+        years."""
         self.tree.setUpdatesEnabled(False)
         filter_text = self.filter_box.text().strip().lower()
+        year_filter = self.year_filter.currentText()
         total_visible = 0
 
         for i in range(self.tree.topLevelItemCount()):
             year_item = self.tree.topLevelItem(i)
+            if year_filter != self._ALL_YEARS_LABEL and year_item.text(0) != year_filter:
+                year_item.setHidden(True)
+                continue
             year_visible_count = 0
             for j in range(year_item.childCount()):
                 child = year_item.child(j)
@@ -998,8 +1025,89 @@ class ProyectosInfoPage(QWidget):
             total_visible += year_visible_count
 
         self.count_label.setText(
-            self._error or f"{total_visible} proyecto(s)"
+            self._error or f"{total_visible} empresa(s)"
         )
+        self.tree.setUpdatesEnabled(True)
+
+    def _on_item_double_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
+        data = item.data(0, Qt.UserRole)
+        if data is not None:
+            year, company = data
+            self.company_opened.emit(year, company)
+
+
+class ProyectosInfoCompanyPage(QWidget):
+    """Flat list of every project row for one company within one year —
+    the page reached by double-clicking a company on ProyectosInfoPage.
+    Loaded fresh each time via load(year, company) rather than kept in
+    sync automatically, same pattern as ProyectosInfoDetailPage. Even a
+    company with a single row lands here first (per the explicit
+    request that singletons behave the same as multi-row companies);
+    double-clicking that one row still opens its own detail card."""
+
+    project_info_opened = Signal(int)
+
+    def __init__(self) -> None:
+        super().__init__()
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(26, 22, 26, 26)
+        outer.setSpacing(14)
+
+        top_bar = QHBoxLayout()
+        self.back_button = QPushButton("←  Volver")
+        self.back_button.setObjectName("LinkButton")
+        self.back_button.setCursor(Qt.PointingHandCursor)
+        top_bar.addWidget(self.back_button, alignment=Qt.AlignLeft)
+        top_bar.addStretch()
+        outer.addLayout(top_bar)
+
+        self.heading = QLabel("")
+        self.heading.setObjectName("SectionTitle")
+        self.heading.setWordWrap(True)
+        outer.addWidget(self.heading)
+
+        self.count_label = QLabel("")
+        self.count_label.setObjectName("MutedText")
+        outer.addWidget(self.count_label)
+
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(3)
+        self.tree.setHeaderLabels(["Estado", "Proyecto", "Título"])
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setRootIsDecorated(False)
+        self.tree.header().setStretchLastSection(False)
+        self.tree.setColumnWidth(0, 160)
+        self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+        outer.addWidget(self.tree, 1)
+
+        self._year: int | None = None
+        self._company: str | None = None
+
+    def load(self, year: int, company: str) -> None:
+        self._year, self._company = year, company
+        self.heading.setText(f"{company} — {year}")
+
+        rows = [
+            row for row in data_service.project_info_rows()
+            if row["year"] == year and (row.get("company") or row["project_name"] or "") == company
+        ]
+        self.count_label.setText(f"{len(rows)} proyecto(s)")
+
+        self.tree.setUpdatesEnabled(False)
+        self.tree.clear()
+        items = []
+        # Original sheet order, same as everywhere else in this page —
+        # not re-sorted.
+        for row in rows:
+            item = QTreeWidgetItem(["", row["project_name"] or "", row.get("full_title") or ""])
+            item.setData(0, Qt.UserRole, row["id"])
+            items.append((item, row.get("status")))
+        self.tree.addTopLevelItems([item for item, _status in items])
+        for item, status in items:
+            self.tree.setItemWidget(item, 0, _make_status_pill(status))
+
+        self.tree.resizeColumnToContents(1)
+        self.tree.resizeColumnToContents(2)
         self.tree.setUpdatesEnabled(True)
 
     def _on_item_double_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
@@ -1368,8 +1476,9 @@ class ProyectosInfoDetailPage(QWidget):
 
 
 class ProyectosInfoNewPage(QWidget):
-    """Form to add a brand-new row to one of the 2024/2025/2026 xlsx
-    files (see src/project_info/writer.py's append_project_info_row —
+    """Form to add a brand-new row to one of the per-year xlsx files
+    (2008-2026, whichever are in reader.YEARS_WITH_DATA — see
+    src/project_info/writer.py's append_project_info_row —
     only ever writes that one new row, nothing existing is touched).
     Same field set as ProyectosInfoDetailPage's Editar form (text fields
     + "Lista de empleados" + the 4 category radio pickers), plus a year
@@ -1417,22 +1526,17 @@ class ProyectosInfoNewPage(QWidget):
         layout.setColumnStretch(1, 1)
         row = 0
 
+        # A combo box, not a row of radio buttons — YEARS_WITH_DATA now
+        # spans 2008-2026 (see reader.py), and ~19 radio buttons side by
+        # side would overflow the form's width. A dropdown scales to
+        # however many years end up in that tuple without needing
+        # another UI change.
         year_label = QLabel("Año:")
         year_label.setObjectName("MetricTitle")
-        year_options = QWidget()
-        year_options_layout = QHBoxLayout(year_options)
-        year_options_layout.setContentsMargins(0, 0, 0, 0)
-        year_options_layout.setSpacing(16)
-        self._year_group = QButtonGroup(year_options)
-        self._year_buttons: dict[str, QRadioButton] = {}
-        for year_str in YEARS_WITH_DATA:
-            button = QRadioButton(year_str)
-            self._year_group.addButton(button)
-            year_options_layout.addWidget(button)
-            self._year_buttons[year_str] = button
-        year_options_layout.addStretch()
+        self._year_combo = QComboBox()
+        self._year_combo.addItems(list(YEARS_WITH_DATA))
         layout.addWidget(year_label, row, 0)
-        layout.addWidget(year_options, row, 1)
+        layout.addWidget(self._year_combo, row, 1)
         row += 1
 
         separator = QFrame()
@@ -1523,9 +1627,7 @@ class ProyectosInfoNewPage(QWidget):
         """Blank every field, called each time the page is opened —
         otherwise the previous project's now-created data would still
         be sitting in the form."""
-        latest_year = YEARS_WITH_DATA[-1]
-        for year_str, button in self._year_buttons.items():
-            button.setChecked(year_str == latest_year)
+        self._year_combo.setCurrentText(YEARS_WITH_DATA[-1])
         for field in self._new_inputs.values():
             field.clear()
         for field in self._new_multiline.values():
@@ -1535,9 +1637,7 @@ class ProyectosInfoNewPage(QWidget):
         self._new_inputs["project_name"].setFocus()
 
     def _on_create_clicked(self) -> None:
-        year_str = next(
-            (y for y, button in self._year_buttons.items() if button.isChecked()), None
-        )
+        year_str = self._year_combo.currentText() or None
         if year_str is None:
             QMessageBox.warning(self, "Falta el año", "Elige a qué año pertenece el proyecto.")
             return
@@ -1864,6 +1964,7 @@ class MainWindow(QMainWindow):
         self.project_page = ProjectDetailPage()
         self.proyectos_info_detail_page = ProyectosInfoDetailPage()
         self.proyectos_info_new_page = ProyectosInfoNewPage()
+        self.proyectos_info_company_page = ProyectosInfoCompanyPage()
         for page in (
             self.projects_page,
             self.proyectos_info_page,
@@ -1872,6 +1973,7 @@ class MainWindow(QMainWindow):
             self.project_page,
             self.proyectos_info_detail_page,
             self.proyectos_info_new_page,
+            self.proyectos_info_company_page,
         ):
             self.stack.addWidget(page)
         main.addWidget(self.stack, 1)
@@ -1880,30 +1982,27 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Listo")
 
-        # Proyectos/Proyectos Info each open their own detail page, so
-        # each back button returns wherever the user actually came from
-        # (set right before navigating to the detail page) rather than
-        # always going to one fixed page. Buscar doesn't open project
-        # pages at all — its folder/file results open directly in
-        # Explorer instead.
-        self._project_return_index = 0
-        self._project_info_return_index = 1
+        # Proyectos/Proyectos Info each open their own detail page, and
+        # Proyectos Info can now go two levels deep (list -> company ->
+        # project detail) — a real stack, not a single "return index"
+        # variable, since a variable gets overwritten by the second
+        # drill-down and breaks the FIRST page's "Volver" (list ->
+        # company -> detail -> back (correct, pops to company) -> back
+        # (used to silently no-op: the variable had been overwritten to
+        # point at the company page itself, not the list). Buscar
+        # doesn't open project pages at all — its folder/file results
+        # open directly in Explorer instead.
+        self._nav_stack: list[int] = []
         self.projects_page.project_opened.connect(self.open_project)
-        self.project_page.back_button.clicked.connect(
-            lambda: self._navigate(self._project_return_index)
-        )
-        self.proyectos_info_page.project_info_opened.connect(self.open_project_info)
-        self.proyectos_info_detail_page.back_button.clicked.connect(
-            lambda: self._navigate(self._project_info_return_index)
-        )
+        self.project_page.back_button.clicked.connect(self._go_back)
+        self.proyectos_info_page.company_opened.connect(self.open_company_projects)
+        self.proyectos_info_company_page.back_button.clicked.connect(self._go_back)
+        self.proyectos_info_company_page.project_info_opened.connect(self.open_project_info)
+        self.proyectos_info_detail_page.back_button.clicked.connect(self._go_back)
         self.proyectos_info_page.new_project_requested.connect(self.open_new_project)
-        self.proyectos_info_new_page.back_button.clicked.connect(
-            lambda: self._navigate(self._project_info_return_index)
-        )
+        self.proyectos_info_new_page.back_button.clicked.connect(self._go_back)
         # A freshly created project opens straight into its own detail
-        # page rather than back to the list, so its own "Volver" needs
-        # to be told to go back to the LIST (not back to the now-stale
-        # Nuevo proyecto form) — see open_new_project_result.
+        # page rather than back to the form — see open_new_project_result.
         self.proyectos_info_new_page.project_created.connect(self.open_new_project_result)
 
         self._navigate(0)
@@ -1980,12 +2079,13 @@ class MainWindow(QMainWindow):
 
     _PAGE_TITLES = {
         0: ("Proyectos", "Lista completa de proyectos — filtra por año o por nombre"),
-        1: ("Proyectos Info", "Ficha de cada proyecto según el Excel (2024-2026)"),
+        1: ("Proyectos Info", "Ficha de cada proyecto según el Excel"),
         2: ("Buscar", "Buscar por nombre de carpeta, dirección o archivo"),
         3: ("Ofertas", "Documentos Firmado y Pedido dentro de FACTURACION/INGEVIA en 02.-GESTIÓN"),
         4: ("Proyecto", ""),
         5: ("Proyecto Info", ""),
-        6: ("Nuevo proyecto", "Añade una fila nueva a uno de los archivos 2024/2025/2026"),
+        6: ("Nuevo proyecto", "Añade una fila nueva a uno de los archivos por año"),
+        7: ("Proyectos de la empresa", ""),
     }
 
     def _navigate(self, index: int) -> None:
@@ -1993,8 +2093,22 @@ class MainWindow(QMainWindow):
         title, subtitle = self._PAGE_TITLES[index]
         self.top_title.setText(title)
         self.top_subtitle.setText(subtitle)
-        for button, button_index in zip(self.nav_buttons, (0, 1, 2, 3)):
-            button.setChecked(button_index == index)
+        if index in (0, 1, 2, 3):
+            for button, button_index in zip(self.nav_buttons, (0, 1, 2, 3)):
+                button.setChecked(button_index == index)
+        else:
+            # Sub-pages (Proyecto, Proyecto Info, Nuevo proyecto, the
+            # company projects page...) have no sidebar entry of their
+            # own. QButtonGroup in exclusive mode refuses to leave ZERO
+            # buttons checked if you call setChecked(False) on the one
+            # that's currently checked — it's a no-op — so without
+            # dropping exclusivity first, the last-visited top-level
+            # page's nav button stays highlighted even after navigating
+            # into a sub-page, wrongly suggesting the app never left it.
+            self.nav_group.setExclusive(False)
+            for button in self.nav_buttons:
+                button.setChecked(False)
+            self.nav_group.setExclusive(True)
         if index == 0:
             self.projects_page.refresh()
         elif index == 1:
@@ -2002,30 +2116,50 @@ class MainWindow(QMainWindow):
         elif index == 3:
             self.ofertas_page.refresh()
 
+    def _open_subpage(self, index: int) -> None:
+        """Navigate to a page reached by drilling into something
+        (project detail, company projects, Nuevo proyecto...) — pushes
+        the CURRENT page onto _nav_stack first, so _go_back() can unwind
+        an arbitrarily deep chain (e.g. list -> company -> detail) one
+        step at a time instead of always jumping to one fixed page."""
+        self._nav_stack.append(self.stack.currentIndex())
+        self._navigate(index)
+
+    def _go_back(self) -> None:
+        index = self._nav_stack.pop() if self._nav_stack else 1
+        self._navigate(index)
+
     def open_project(self, project_id: int) -> None:
-        # Remember which page this was opened from, BEFORE switching away
-        # from it, so the project page's back button returns there.
-        self._project_return_index = self.stack.currentIndex()
         self.project_page.load(project_id)
-        self._navigate(4)
+        self._open_subpage(4)
+
+    def open_company_projects(self, year: int, company: str) -> None:
+        self.proyectos_info_company_page.load(year, company)
+        self._open_subpage(7)
 
     def open_project_info(self, item_id: int) -> None:
-        self._project_info_return_index = self.stack.currentIndex()
+        # Reached from wherever the user actually drilled in from — the
+        # company page (normal path) or, after creating a project,
+        # straight from open_new_project_result below — _open_subpage
+        # records that automatically.
         self.proyectos_info_detail_page.load(item_id)
-        self._navigate(5)
+        self._open_subpage(5)
 
     def open_new_project(self) -> None:
-        self._project_info_return_index = self.stack.currentIndex()
         self.proyectos_info_new_page.reset()
-        self._navigate(6)
+        self._open_subpage(6)
 
     def open_new_project_result(self, item_id: int) -> None:
-        # Deliberately NOT open_project_info() — that would set the
-        # return index to the Nuevo proyecto form (index 6, the current
-        # page when this fires), so "Volver" on the detail page would
-        # land back on a stale, already-submitted form instead of the
-        # list. Always go back to the list itself here.
-        self._project_info_return_index = 1
+        # Deliberately NOT _open_subpage(5) — that would push the Nuevo
+        # proyecto form (6, the current page when this fires) onto the
+        # stack, so "Volver" on the detail page would land back on a
+        # stale, already-submitted form. Instead, pop the entry
+        # open_new_project() pushed (wherever "+ Nuevo proyecto" was
+        # actually clicked from) and push that same value again — same
+        # stack depth, but the detail page's "Volver" skips the form
+        # entirely and returns to that original page.
+        return_index = self._nav_stack.pop() if self._nav_stack else 1
+        self._nav_stack.append(return_index)
         self.proyectos_info_detail_page.load(item_id)
         self._navigate(5)
 
