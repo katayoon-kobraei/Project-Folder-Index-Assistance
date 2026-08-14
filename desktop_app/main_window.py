@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 import time
 from pathlib import Path
 
@@ -866,6 +867,51 @@ def _make_status_pill(status: str | None) -> QLabel:
     return pill
 
 
+# Plain-text colors matching each pill's own text color in styles.py
+# (QLabel#SuccessPill/WarningPill/etc. { color: ... }) — used ONLY for
+# ProyectosInfoPage's tree, which can have up to one row-item per EVERY
+# project (thousands, not the bounded ~30-per-company a real pill widget
+# is fine for on ProyectosInfoCompanyPage). setItemWidget()-ing a real
+# QLabel per row for that many items measured fine in isolation but
+# still caused a real, user-reported freeze while filtering — Qt's
+# QTreeWidget keeps every registered item-widget "live" for as long as
+# its item exists, hidden or not, and operations that touch the
+# model/view (resizeColumnToContents, setHidden, etc.) apparently have
+# to account for all of them, not just the visible ones. Plain colored
+# TEXT via setForeground has no such per-widget bookkeeping — same
+# color coding, none of the cost.
+_PLANNING_TEXT_COLORS = {
+    "Acabado": "#087443",
+    "Cancelado": "#b42318",
+    "Proceso": "#9a5300",
+    "DO": "#3a4b5c",
+    "Inicio Proyecto": "#1d4ed8",
+}
+
+
+def _set_status_text(item: QTreeWidgetItem, column: int, status: str | None) -> None:
+    item.setText(column, status or "Sin estado")
+    color = _PLANNING_TEXT_COLORS.get((status or "").strip(), "#3a4b5c")
+    item.setForeground(column, QColor(color))
+    bold_font = item.font(column)
+    bold_font.setBold(True)
+    item.setFont(column, bold_font)
+
+
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _words(text: str) -> set[str]:
+    """Lowercased whole-word tokens in `text` — used by ProyectosInfoPage
+    's search box to match a typed word against a whole word in the
+    data, NOT as a substring anywhere. A plain substring check would
+    let e.g. "forn" match inside "FORNES" (a surname, nothing to do
+    with "Forn" the street) — real false positive seen with the search
+    "c del forn": "forn" is a substring of "TONI FORNES" in an
+    unrelated company's title, but not a whole word there."""
+    return set(_WORD_RE.findall(text.lower()))
+
+
 class ProyectosInfoPage(QWidget):
     """Year -> company hierarchy read from the hand-maintained 'LISTADO
     PROYECTOS POR AÑOS' workbook (project_info_path in config.yaml) — a
@@ -882,12 +928,28 @@ class ProyectosInfoPage(QWidget):
     doesn't expand it in place; it navigates to ProyectosInfoCompanyPage,
     which lists that company's rows for that year and is where
     double-clicking an individual row opens its own detail card
-    (ProyectosInfoDetailPage)."""
+    (ProyectosInfoDetailPage).
+
+    EXCEPTION to "no in-place expansion": while a search/category filter
+    is active and it narrows a company down to specific matching row(s)
+    (see _row_fully_matches), those matching rows themselves ARE shown
+    as children under the company node, auto-expanded — so e.g.
+    searching "san ramon" shows the "SAN RAMON" row right there under
+    PLENERGY, not just a "(1 de 33)" badge the user still has to open
+    the company page and hunt through 33 rows to find. Double-clicking
+    one of these child rows opens its detail card directly
+    (project_info_opened), skipping the company page entirely. When no
+    filter is active, or when a match can't be traced to a single row
+    (e.g. "urb torrent", see _company_matches_text), no children are
+    shown and double-clicking the company still opens
+    ProyectosInfoCompanyPage as before."""
 
     company_opened = Signal(int, str)  # (year, company)
+    project_info_opened = Signal(int)  # a matched row's own id, opened directly
     new_project_requested = Signal()
 
     _ALL_YEARS_LABEL = "Todos los años"
+    _ALL_CATEGORY_LABEL = "Todos"
 
     def __init__(self) -> None:
         super().__init__()
@@ -910,7 +972,9 @@ class ProyectosInfoPage(QWidget):
         subtitle = QLabel(
             f"Datos del archivo Excel de proyectos ({YEARS_WITH_DATA[0]}-{YEARS_WITH_DATA[-1]}), "
             "agrupados por empresa/cliente. Haz doble clic en una empresa para ver "
-            "sus proyectos."
+            "sus proyectos. La búsqueda también encuentra texto dentro de los "
+            "proyectos de cada empresa (nombre y título), no solo en el nombre de "
+            "la empresa."
         )
         subtitle.setObjectName("MutedText")
         subtitle.setWordWrap(True)
@@ -919,7 +983,9 @@ class ProyectosInfoPage(QWidget):
         filter_row = QHBoxLayout()
         filter_row.setSpacing(10)
         self.filter_box = QLineEdit()
-        self.filter_box.setPlaceholderText("Filtrar por nombre de proyecto...")
+        self.filter_box.setPlaceholderText(
+            "Filtrar por empresa, nombre de proyecto o título..."
+        )
         self.filter_box.textChanged.connect(self._on_filter_changed)
         filter_row.addWidget(self.filter_box, 1)
 
@@ -929,7 +995,49 @@ class ProyectosInfoPage(QWidget):
         self.year_filter.setMinimumWidth(130)
         self.year_filter.currentIndexChanged.connect(self._apply_filter)
         filter_row.addWidget(self.year_filter)
+
+        # Collapsed by default — clicking this reveals the panel below
+        # with the 4 category dropdowns, rather than always taking up a
+        # whole row. Its own label shows how many of those are actually
+        # active (see _apply_filter), so the count is visible even while
+        # the panel itself is collapsed.
+        self.filters_toggle = QPushButton("▾  Filtros")
+        self.filters_toggle.setObjectName("SecondaryButton")
+        self.filters_toggle.setCursor(Qt.PointingHandCursor)
+        self.filters_toggle.setCheckable(True)
+        self.filters_toggle.toggled.connect(self._on_filters_toggle)
+        filter_row.addWidget(self.filters_toggle)
         outer.addLayout(filter_row)
+
+        # The same 4 fixed-category fields as the detail page's tick
+        # boxes (Estado/Tipo/Subtipo1/Subtipo2), as a filter here
+        # instead — a company matches a given category filter if ANY of
+        # its rows has that value (see _apply_filter), since the
+        # company itself doesn't have a single value for these.
+        self.category_panel = QWidget()
+        category_row = QHBoxLayout(self.category_panel)
+        category_row.setContentsMargins(0, 0, 0, 0)
+        category_row.setSpacing(10)
+        self._category_filters: dict[str, QComboBox] = {}
+        for key, spanish_label in (
+            ("status", "Estado"),
+            ("work_type", "Tipo"),
+            ("subtipo1", "Subtipo 1"),
+            ("subtipo2", "Subtipo 2"),
+        ):
+            field_label = QLabel(f"{spanish_label}:")
+            field_label.setObjectName("MutedText")
+            category_row.addWidget(field_label)
+            combo = QComboBox()
+            combo.addItem(self._ALL_CATEGORY_LABEL)
+            combo.addItems(CATEGORY_OPTIONS[key])
+            combo.setMinimumWidth(150)
+            combo.currentIndexChanged.connect(self._apply_filter)
+            self._category_filters[key] = combo
+            category_row.addWidget(combo)
+        category_row.addStretch()
+        self.category_panel.setVisible(False)
+        outer.addWidget(self.category_panel)
 
         # Filtering just show/hides existing rows (see _apply_filter) —
         # cheap — but debounced anyway so a fast typist doesn't trigger
@@ -956,15 +1064,35 @@ class ProyectosInfoPage(QWidget):
         # and rely on the tree's own horizontal scrollbar past the
         # window edge.
         self.tree.header().setStretchLastSection(False)
-        # Wide enough for the longest pill text ("Sin estado") without
-        # Qt squeezing the pill widget to fit the column, which distorts
-        # it into an illegible sliver instead of just clipping cleanly.
-        self.tree.setColumnWidth(0, 160)
+        # Wide enough for the longest status text ("Sin estado") plus
+        # room for the branch/expand indentation of a matched ROW child
+        # (see _build_tree/_apply_filter), which sits two levels deep
+        # (year -> company -> row) — without this extra room, that
+        # indentation ate into column 0's usable width and clipped the
+        # text against the column edge.
+        self.tree.setColumnWidth(0, 130 + 2 * self.tree.indentation())
         self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
         outer.addWidget(self.tree, 1)
 
         self._rows: list[dict] = []
         self._error: str | None = None
+        # id(company_item) for every company that CURRENTLY has one or
+        # more of its row children revealed (see _apply_filter) — lets
+        # a filter change that reveals nothing new skip re-hiding rows
+        # for the (usually large) majority of companies that never had
+        # any shown in the first place, instead of looping over every
+        # row of every company on every keystroke regardless of whether
+        # there's anything to actually undo.
+        self._companies_with_revealed_rows: set[int] = set()
+        # id(row) -> frozenset of that row's own project_name/full_title
+        # words (see _row_words) — a row's text never changes once
+        # loaded, but _company_matches_text/_row_fully_matches used to
+        # re-tokenize it with a fresh regex pass on EVERY keystroke for
+        # EVERY row of EVERY company being checked (~7,800 calls for a
+        # single broad search over the full dataset) — a real, measured
+        # chunk of _apply_filter's cost. Computing each row's word set
+        # once and reusing it removes that repeat work entirely.
+        self._row_words_cache: dict[int, frozenset[str]] = {}
 
     def refresh(self) -> None:
         """Called every time this page is navigated to — NOT just when
@@ -1017,9 +1145,33 @@ class ProyectosInfoPage(QWidget):
         a company has. There's no in-place expansion any more: each
         company item carries (year, company) via setData, and double-
         clicking it navigates to ProyectosInfoCompanyPage instead (see
-        _on_item_double_clicked / company_opened)."""
+        _on_item_double_clicked / company_opened).
+
+        EACH company's individual rows are ALSO built here as children
+        of their company item — one per row, hidden by default — rather
+        than being created on demand inside _apply_filter. A search or
+        category filter that narrows a company down to specific matching
+        row(s) reveals the matching ones via setHidden(False) (see
+        _apply_filter), it doesn't construct them. This matters a lot
+        for performance: this method only runs once per data refresh, so
+        building every row item here (parented to its company item
+        BEFORE that company item's own year_item is attached to the
+        tree, same off-tree-then-attach-once trick as above) is a
+        one-time cost. Building/destroying row items on every keystroke
+        instead — which is what an earlier version of this did — was
+        measured taking 3.6+ seconds for a single broad search (e.g. the
+        letter "a", which narrows hundreds of companies at once): even
+        batched via addChildren(), inserting into a company item that's
+        already live inside an on-screen tree with ~1100+ existing items
+        forces Qt to redo bookkeeping across the WHOLE tree on every
+        single insertion call, not just the new item(s) — the same
+        "quadratic against a live tree" trap called out above, just one
+        level deeper. Pre-building once and only toggling .setHidden()
+        afterwards is what actually fixes it."""
         self.tree.setUpdatesEnabled(False)
         self.tree.clear()
+        self._companies_with_revealed_rows.clear()
+        self._row_words_cache.clear()
 
         if self._error:
             self.count_label.setText(self._error)
@@ -1051,6 +1203,26 @@ class ProyectosInfoPage(QWidget):
                     year_item, ["", f"{company} ({len(company_rows)})", ""]
                 )
                 company_item.setData(0, Qt.UserRole, (year, company))
+                # The underlying rows themselves, stored on a different
+                # (row, column) slot so it doesn't clash with the tuple
+                # above — _apply_filter() searches into these (project
+                # name, title) and checks them against the category
+                # filters, not just the "COMPANY (n)" label text.
+                company_item.setData(1, Qt.UserRole, company_rows)
+
+                for row in company_rows:
+                    row_item = QTreeWidgetItem(
+                        company_item, ["", row.get("project_name") or "", row.get("full_title") or ""]
+                    )
+                    row_item.setData(0, Qt.UserRole + 1, row["id"])
+                    row_item.setHidden(True)
+                    # Plain colored TEXT (see _set_status_text), NOT a
+                    # setItemWidget() pill — this loop can run for every
+                    # single project (thousands), and a real embedded
+                    # QLabel per row at that scale is what caused the
+                    # freeze-while-filtering reported after an earlier
+                    # version of this (see _set_status_text's docstring).
+                    _set_status_text(row_item, 0, row.get("status"))
             year_items.append(year_item)
 
         self.tree.addTopLevelItems(year_items)
@@ -1065,15 +1237,147 @@ class ProyectosInfoPage(QWidget):
     def _on_filter_changed(self) -> None:
         self._filter_timer.start()  # restarts the 150ms countdown on every keystroke
 
+    def _on_filters_toggle(self, checked: bool) -> None:
+        self.category_panel.setVisible(checked)
+        self._refresh_filters_toggle_text()
+
+    def _refresh_filters_toggle_text(self) -> None:
+        """Keeps the "Filtros" button's own label showing how many of
+        the 4 category filters are actually active, so that count is
+        visible even while the panel itself is collapsed — called both
+        when the panel is opened/closed and whenever a category combo
+        changes (see _apply_filter)."""
+        active = sum(
+            1 for combo in self._category_filters.values()
+            if combo.currentText() != self._ALL_CATEGORY_LABEL
+        )
+        arrow = "▴" if self.filters_toggle.isChecked() else "▾"
+        label = f"Filtros ({active})" if active else "Filtros"
+        self.filters_toggle.setText(f"{arrow}  {label}")
+
+    def _company_matches_text(
+        self, label_text: str, company_rows: list[dict], filter_words: list[str]
+    ) -> bool:
+        """Whether EVERY word typed in the search box is an EXACT whole
+        word SOMEWHERE for this company — its own "COMPANY (n)" label,
+        or any of its rows' project name/title — not necessarily all in
+        the same place, and not just a substring buried inside a longer,
+        unrelated word.
+
+        Two things this has to get right at once, from two real
+        examples:
+          - "urb torrent" must find "AYTO TORRENT - URB-VENTETA Y
+            PANTA" even though "torrent" only comes from the company
+            label and "urb" only from inside a row's own project name
+            — the literal phrase "urb torrent" never appears together
+            anywhere (the real text is "TORRENT - URB-VENTETA",
+            reversed, with punctuation in between). That's why this
+            checks each word independently against one combined
+            haystack instead of one single phrase/substring match.
+          - "c del forn" must NOT match a company just because "forn"
+            happens to be a substring of "FORNES" (a surname) in some
+            unrelated row's title — a plain substring check did exactly
+            that. Matching against WHOLE words (via _words()) instead
+            of "is this text contained anywhere" fixes it: "fornes" is
+            a whole word, "forn" isn't equal to it, so it no longer
+            matches."""
+        haystack_words = _words(label_text)
+        for row in company_rows:
+            haystack_words |= self._row_words(row)
+        return all(word in haystack_words for word in filter_words)
+
+    def _row_words(self, row: dict) -> frozenset[str]:
+        """This row's own project_name/full_title words, tokenized once
+        and cached by the row's own stable "id" field — see
+        _row_words_cache in __init__ for why this matters (re-tokenizing
+        every row on every keystroke was a real, measured chunk of
+        _apply_filter's cost).
+
+        Keyed by row["id"], NOT Python's id(row): `row` here almost
+        always comes from company_item.data(1, Qt.UserRole), and PySide6
+        does NOT preserve object identity for a plain Python list-of-
+        dicts round-tripped through QTreeWidgetItem.setData()/.data() —
+        every single .data() call reconstructs a BRAND NEW list of
+        brand new dict objects with different id()s (confirmed directly:
+        item.data(...) is item.data(...) is False). Caching by id(row)
+        therefore almost never actually hit the SAME row twice — worse,
+        because those throwaway dicts get garbage collected immediately,
+        Python was free to reuse their memory addresses for the NEXT
+        unrelated temporary dict, so a cache "hit" could silently return
+        a completely different row's words. That was a real, confirmed
+        correctness bug (searching "a" matched a different, wrong number
+        of companies on every run) caught while chasing this
+        performance fix — row["id"] is a plain int copied by value, so
+        it survives that round-trip correctly."""
+        key = row["id"]
+        cached = self._row_words_cache.get(key)
+        if cached is None:
+            cached = frozenset(
+                _words(row.get("project_name") or "") | _words(row.get("full_title") or "")
+            )
+            self._row_words_cache[key] = cached
+        return cached
+
+    def _row_matches_categories(self, row: dict) -> bool:
+        """Whether this one row satisfies every ACTIVE category filter
+        at once (Estado/Tipo/Subtipo1/Subtipo2) — a filter left on
+        "Todos" is skipped, not treated as "must be blank"."""
+        for key, combo in self._category_filters.items():
+            selected = combo.currentText()
+            if selected != self._ALL_CATEGORY_LABEL and (row.get(key) or "") != selected:
+                return False
+        return True
+
+    def _row_fully_matches(self, row: dict, filter_words: list[str]) -> bool:
+        """Whether THIS one row's own project name/title — not the
+        company label, not any of its sibling rows — contains every
+        filter word. Used only to count how many of a company's rows
+        specifically matched (see _apply_filter's "(n de total)" label),
+        which is well-defined for the common case (e.g. "san ramon"
+        landing entirely inside one row's own name) but NOT for a match
+        that only exists by combining the company label with a
+        DIFFERENT row (e.g. "urb torrent", see _company_matches_text) —
+        there's no single row to point to in that case, so this
+        correctly returns False for every row and the caller falls back
+        to showing the plain total instead of a possibly-misleading
+        count."""
+        if not filter_words:
+            return True
+        return all(word in self._row_words(row) for word in filter_words)
+
     def _apply_filter(self) -> None:
-        """Shows/hides the tree's EXISTING items to match the filter box
-        and the year dropdown — no items are created or destroyed here,
-        which is what keeps this fast enough to run on every keystroke
-        (after the debounce) even with several thousand rows across 19
-        years."""
+        """Shows/hides the tree's EXISTING items to match the search
+        box, year dropdown, and the 4 category filters — no items are
+        created or destroyed here (see _build_tree, which now
+        pre-builds every row item too, hidden by default), which is
+        what keeps this fast enough to run on every keystroke (after
+        the debounce) even with several thousand rows across 19 years —
+        an earlier version of this DID build/destroy row items here on
+        every keystroke, and that turned out to be a real, measured
+        performance bug (3.6+ seconds for a single broad search) fixed
+        by moving all item construction into _build_tree instead; see
+        that method's docstring for the full story.
+
+        A company is shown if year matches AND every word typed in the
+        search box turns up somewhere for that company (see
+        _company_matches_text) AND at least one of its rows satisfies
+        every active category filter at once. The text condition and
+        the category condition are checked independently — they don't
+        have to be satisfied by the exact same row — which keeps this
+        simple while still being right for the overwhelming majority of
+        real searches (a company rarely has such wildly different rows
+        that this loose combination would be misleading)."""
         self.tree.setUpdatesEnabled(False)
-        filter_text = self.filter_box.text().strip().lower()
+        # Tokenized the same way as the haystack in _company_matches_text
+        # (via _words()) — not a raw .split() — so a stray "/" or "-" in
+        # what's typed (e.g. "c/ del forn") doesn't stop a word from
+        # being recognized as the same token it'd be in the data.
+        filter_words = list(_words(self.filter_box.text()))
         year_filter = self.year_filter.currentText()
+        any_category_active = any(
+            combo.currentText() != self._ALL_CATEGORY_LABEL
+            for combo in self._category_filters.values()
+        )
         total_visible = 0
 
         for i in range(self.tree.topLevelItemCount()):
@@ -1084,7 +1388,69 @@ class ProyectosInfoPage(QWidget):
             year_visible_count = 0
             for j in range(year_item.childCount()):
                 child = year_item.child(j)
-                matches = not filter_text or filter_text in child.text(1).lower()
+                company_rows = child.data(1, Qt.UserRole) or []
+                company = child.data(0, Qt.UserRole)[1]  # (year, company) tuple
+
+                text_ok = not filter_words or self._company_matches_text(
+                    company, company_rows, filter_words
+                )
+                category_ok = not any_category_active or any(
+                    self._row_matches_categories(row) for row in company_rows
+                )
+                matches = text_ok and category_ok
+
+                # Whichever of this company's own rows individually
+                # satisfy BOTH active conditions at once — used both for
+                # the "(n de total)" badge below AND to reveal those
+                # exact rows' PRE-BUILT child items (see _build_tree),
+                # so the user can jump straight to the matching project
+                # instead of opening the company page and hunting for it
+                # among all its rows. No row is revealed (all stay
+                # hidden) when nothing's filtered, or when the match
+                # doesn't trace back to any single row (see
+                # _row_fully_matches) — company_rows[k] and
+                # child.child(k) are always the same row, same order, so
+                # no separate id lookup is needed here.
+                company_key = id(child)
+                any_row_visible = False
+                if matches and (filter_words or any_category_active):
+                    matched_count = 0
+                    total = len(company_rows)
+                    for k, row in enumerate(company_rows):
+                        row_visible = self._row_fully_matches(row, filter_words) and self._row_matches_categories(row)
+                        child.child(k).setHidden(not row_visible)
+                        if row_visible:
+                            matched_count += 1
+                    any_row_visible = matched_count > 0
+                    if any_row_visible:
+                        self._companies_with_revealed_rows.add(company_key)
+                    else:
+                        self._companies_with_revealed_rows.discard(company_key)
+                    if any_row_visible and matched_count < total:
+                        child.setText(1, f"{company} ({matched_count} de {total})")
+                    else:
+                        child.setText(1, f"{company} ({total})")
+                else:
+                    if matches:
+                        child.setText(1, f"{company} ({len(company_rows)})")
+                    # Filter cleared, or this company no longer matches
+                    # at all — make sure no previously-revealed row stays
+                    # visible underneath it, but ONLY do that (bothering
+                    # to touch every one of this company's row items) for
+                    # a company that's actually in
+                    # _companies_with_revealed_rows — i.e. actually had
+                    # something to undo. The overwhelming majority of
+                    # companies never reveal a row in the first place, so
+                    # skipping them here is what keeps clearing/loosening
+                    # a filter cheap instead of re-touching all ~2,400
+                    # row items on every single keystroke regardless of
+                    # whether anything's actually visible.
+                    if company_key in self._companies_with_revealed_rows:
+                        for k in range(child.childCount()):
+                            child.child(k).setHidden(True)
+                        self._companies_with_revealed_rows.discard(company_key)
+
+                child.setExpanded(any_row_visible)
                 child.setHidden(not matches)
                 if matches:
                     year_visible_count += 1
@@ -1094,9 +1460,23 @@ class ProyectosInfoPage(QWidget):
         self.count_label.setText(
             self._error or f"{total_visible} empresa(s)"
         )
+        # Labels can grow longer than the original "(n)" (e.g. "(1 de
+        # 33)") — re-measure column 1 so that doesn't get clipped. Also
+        # column 2: at the last full _build_tree(), every visible item
+        # was a company row with a blank Título cell, so column 2 was
+        # sized to little more than its header — a now-revealed matching
+        # row can have a real, much longer Título that needs the column
+        # to grow to show it.
+        self.tree.resizeColumnToContents(1)
+        self.tree.resizeColumnToContents(2)
         self.tree.setUpdatesEnabled(True)
+        self._refresh_filters_toggle_text()
 
     def _on_item_double_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
+        row_id = item.data(0, Qt.UserRole + 1)
+        if row_id is not None:
+            self.project_info_opened.emit(row_id)
+            return
         data = item.data(0, Qt.UserRole)
         if data is not None:
             year, company = data
@@ -2063,6 +2443,12 @@ class MainWindow(QMainWindow):
         self.projects_page.project_opened.connect(self.open_project)
         self.project_page.back_button.clicked.connect(self._go_back)
         self.proyectos_info_page.company_opened.connect(self.open_company_projects)
+        # A matched row shown directly under a company (search/category
+        # filter narrowed it down — see ProyectosInfoPage._set_company_
+        # children) opens its detail card straight away, same as any
+        # other entry point into that page — no need to detour through
+        # the company page first.
+        self.proyectos_info_page.project_info_opened.connect(self.open_project_info)
         self.proyectos_info_company_page.back_button.clicked.connect(self._go_back)
         self.proyectos_info_company_page.project_info_opened.connect(self.open_project_info)
         self.proyectos_info_detail_page.back_button.clicked.connect(self._go_back)
