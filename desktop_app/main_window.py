@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -89,6 +90,24 @@ STATUS_LABELS = {
 }
 SOURCE_LABELS = {"trabajos": "Trabajos", "ofertas": "Ofertas"}
 FILE_SEARCH_LIMIT = 300
+
+
+def open_local_path(parent: QWidget, path: str, what: str) -> None:
+    """QDesktopServices-open a local file/folder path (launches whatever
+    app Windows has associated with it — Excel for .xlsx), showing a
+    Spanish warning dialog on `parent` if it fails (file no longer
+    exists, no default app registered, etc.) instead of silently doing
+    nothing. Shared by every "Abrir Excel"/"Abrir carpeta"/"Abrir
+    archivo" button added after this helper existed; a few earlier
+    buttons (SearchPage) still inline the same two statements directly
+    rather than being refactored to call this, purely to avoid touching
+    already-working code without a reason to."""
+    if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+        QMessageBox.warning(
+            parent,
+            f"No se pudo abrir {what}",
+            f"No se pudo abrir:\n{path}\n\n¿Sigue existiendo en esa ubicación?",
+        )
 
 
 def containing_folder(path: str) -> str:
@@ -168,9 +187,13 @@ class SyncTrabajosWorker(QThread):
 
     finished_with_result = Signal(bool, str, dict)
 
+    def __init__(self, year: int, parent=None) -> None:
+        super().__init__(parent)
+        self._year = year
+
     def run(self) -> None:
         try:
-            result = data_service.sync_new_projects_from_trabajos()
+            result = data_service.sync_new_projects_from_trabajos(year=self._year)
             self.finished_with_result.emit(True, "", result)
         except Exception as exc:
             self.finished_with_result.emit(False, str(exc), {})
@@ -1635,11 +1658,31 @@ class ProyectosInfoPage(QWidget):
         self.tree.addTopLevelItems(year_items)
         for year_item in year_items:
             year_item.setExpanded(True)
+            # setItemWidget needs the item already attached to the tree
+            # (hence only done here, after addTopLevelItems above, not
+            # while year_items was still being built off-tree) — but
+            # only ~19 of these (one per year, see YEARS_WITH_DATA), not
+            # per company/row, so none of the "embedded widget at scale"
+            # performance concerns from the rest of this method apply.
+            year = int(year_item.text(0))
+            open_button = QPushButton("📗  Abrir Excel")
+            open_button.setObjectName("LinkButton")
+            open_button.setCursor(Qt.PointingHandCursor)
+            open_button.clicked.connect(lambda checked=False, y=year: self._open_year_excel(y))
+            self.tree.setItemWidget(year_item, 1, open_button)
 
         self.tree.resizeColumnToContents(1)
         self.tree.resizeColumnToContents(2)
         self.tree.setUpdatesEnabled(True)
         self._apply_filter()
+
+    def _open_year_excel(self, year: int) -> None:
+        try:
+            path = data_service.project_info_file_path(year)
+        except FileNotFoundError as exc:
+            QMessageBox.warning(self, "Archivo no encontrado", str(exc))
+            return
+        open_local_path(self, path, f"el archivo {year}.xlsx")
 
     def _on_filter_changed(self) -> None:
         self._filter_timer.start()  # restarts the 150ms countdown on every keystroke
@@ -2019,6 +2062,14 @@ class ProyectosInfoDetailPage(QWidget):
         self.back_button.setCursor(Qt.PointingHandCursor)
         top_bar.addWidget(self.back_button, alignment=Qt.AlignLeft)
         top_bar.addStretch()
+        # Opens the exact {year}.xlsx this row's data is read from AND
+        # written back into (see writer.py) — the year comes from
+        # self._data["year"], set fresh on every load().
+        self.open_excel_button = QPushButton("📗  Abrir Excel")
+        self.open_excel_button.setObjectName("SecondaryButton")
+        self.open_excel_button.setCursor(Qt.PointingHandCursor)
+        self.open_excel_button.clicked.connect(self._open_excel)
+        top_bar.addWidget(self.open_excel_button)
         self.edit_button = QPushButton("✏️  Editar")
         self.edit_button.setObjectName("SecondaryButton")
         self.edit_button.setCursor(Qt.PointingHandCursor)
@@ -2325,6 +2376,16 @@ class ProyectosInfoDetailPage(QWidget):
             widget = item.widget()
             if widget:
                 widget.deleteLater()
+
+    def _open_excel(self) -> None:
+        if self._data is None:
+            return
+        try:
+            path = data_service.project_info_file_path(self._data["year"])
+        except FileNotFoundError as exc:
+            QMessageBox.warning(self, "Archivo no encontrado", str(exc))
+            return
+        open_local_path(self, path, f"el archivo {self._data['year']}.xlsx")
 
     def load(self, item_id: int) -> None:
         self._item_id = item_id
@@ -3213,6 +3274,16 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1080, 680)
         self.refresh_worker: RefreshWorker | None = None
         self.sync_trabajos_worker: SyncTrabajosWorker | None = None
+        self._refresh_started_at: float | None = None
+        self._refresh_current_stage_label = ""
+        # Ticks once a second while a refresh is running, purely to keep
+        # the elapsed-time text in the top bar's status label current
+        # (see _update_refresh_elapsed) — the stage text itself only
+        # changes when RefreshWorker.stage_changed actually fires, which
+        # can be minutes apart during a long crawl.
+        self._refresh_elapsed_timer = QTimer(self)
+        self._refresh_elapsed_timer.setInterval(1000)
+        self._refresh_elapsed_timer.timeout.connect(self._update_refresh_elapsed)
 
         root = QWidget()
         root.setObjectName("AppRoot")
@@ -3404,6 +3475,29 @@ class MainWindow(QMainWindow):
         layout.addLayout(title_block)
         layout.addStretch()
 
+        # Lives in the top bar (not on any one page) so it's visible no
+        # matter which page you're on while "Actualizar" runs — Buscar
+        # included, which otherwise had no progress indicator of its own
+        # at all (see ProjectsPage.set_processing for the page-local one
+        # that only ever showed on the Proyectos page). Indeterminate
+        # (setRange(0, 0), a continuously animating bar) rather than a
+        # real percentage — there's no reliable way to know the total
+        # folder/file count on P: in advance, so a filled/emptying bar
+        # would just be showing a fake number. The elapsed-time label
+        # next to it (see _update_refresh_elapsed) is what actually
+        # gives a sense of how long it's been running instead.
+        self.refresh_progress = QProgressBar()
+        self.refresh_progress.setRange(0, 0)
+        self.refresh_progress.setFixedWidth(120)
+        self.refresh_progress.setTextVisible(False)
+        self.refresh_progress.setVisible(False)
+        layout.addWidget(self.refresh_progress)
+
+        self.refresh_status_label = QLabel("")
+        self.refresh_status_label.setObjectName("MutedText")
+        self.refresh_status_label.setVisible(False)
+        layout.addWidget(self.refresh_status_label)
+
         self.refresh_button = QPushButton("↻  Actualizar")
         self.refresh_button.setObjectName("PrimaryButton")
         self.refresh_button.setCursor(Qt.PointingHandCursor)
@@ -3546,6 +3640,17 @@ class MainWindow(QMainWindow):
         self.projects_page.set_processing(True, "Iniciando actualización...")
         self.statusBar().showMessage("Actualizando en segundo plano...")
 
+        # Top-bar indicator — see _build_topbar for why this is separate
+        # from projects_page's own bar: this one is visible on every
+        # page (Buscar included), that one only while looking at
+        # Proyectos.
+        self._refresh_started_at = time.time()
+        self._refresh_current_stage_label = "Iniciando actualización..."
+        self.refresh_progress.setVisible(True)
+        self.refresh_status_label.setVisible(True)
+        self._update_refresh_elapsed()
+        self._refresh_elapsed_timer.start()
+
         self.refresh_worker = RefreshWorker(self)
         self.refresh_worker.stage_changed.connect(self._refresh_stage_changed)
         self.refresh_worker.finished_with_result.connect(self._refresh_finished)
@@ -3555,11 +3660,46 @@ class MainWindow(QMainWindow):
         label = STAGE_LABELS.get(stage, stage)
         self.projects_page.set_processing(True, label)
         self.statusBar().showMessage(label)
+        self._refresh_current_stage_label = label
+        self._update_refresh_elapsed()
+
+    def _update_refresh_elapsed(self) -> None:
+        """Refreshes the top bar's "<stage> (mm:ss)" text — called once a
+        second by _refresh_elapsed_timer AND immediately whenever the
+        stage itself changes, so the label never sits on a stale minute
+        count for up to a full second after either kind of update."""
+        if self._refresh_started_at is None:
+            return
+        elapsed = int(time.time() - self._refresh_started_at)
+        minutes, seconds = divmod(elapsed, 60)
+        self.refresh_status_label.setText(
+            f"{self._refresh_current_stage_label} ({minutes}:{seconds:02d})"
+        )
 
     def run_sync_trabajos(self) -> None:
         if self.sync_trabajos_worker and self.sync_trabajos_worker.isRunning():
             return
-        year = datetime.date.today().year
+
+        # Year picker — defaults to the current calendar year (the old,
+        # only-ever-current-year behavior) but lets you target any other
+        # year's TRABAJOS folder/xlsx instead, e.g. to catch up 2025.xlsx
+        # for something added there after the fact. Same newest-first
+        # year list as every other year dropdown in the app.
+        years = [str(y) for y in reversed(YEARS_WITH_DATA)]
+        current_year_str = str(datetime.date.today().year)
+        default_index = years.index(current_year_str) if current_year_str in years else 0
+        year_str, ok = QInputDialog.getItem(
+            self,
+            "Sincronizar carpetas nuevas",
+            "Elige el año a sincronizar:",
+            years,
+            default_index,
+            editable=False,
+        )
+        if not ok:
+            return
+        year = int(year_str)
+
         answer = QMessageBox.question(
             self,
             "Sincronizar carpetas nuevas",
@@ -3577,7 +3717,7 @@ class MainWindow(QMainWindow):
         self.proyectos_info_page.sync_trabajos_button.setText("⟳  Sincronizando...")
         self.statusBar().showMessage(f"Buscando carpetas nuevas en TRABAJOS {year}...")
 
-        self.sync_trabajos_worker = SyncTrabajosWorker(self)
+        self.sync_trabajos_worker = SyncTrabajosWorker(year, self)
         self.sync_trabajos_worker.finished_with_result.connect(self._sync_trabajos_finished)
         self.sync_trabajos_worker.start()
 
@@ -3590,6 +3730,8 @@ class MainWindow(QMainWindow):
             return
 
         added = result.get("added") or []
+        year = result.get("year")
+        year_suffix = f" ({year})" if year else ""
         if not result.get("trabajos_dir"):
             self.statusBar().showMessage("Sincronización terminada", 4000)
             QMessageBox.warning(
@@ -3601,13 +3743,14 @@ class MainWindow(QMainWindow):
             return
 
         self.statusBar().showMessage(
-            f"Sincronización completada: {len(added)} fila(s) nueva(s)", 6000
+            f"Sincronización completada{year_suffix}: {len(added)} fila(s) nueva(s)", 6000
         )
         if added:
             lines = "\n".join(f"  • {row['nombre']}  ({row['numero_de_proyecto']})" for row in added)
             QMessageBox.information(
                 self,
                 "Sincronización completada",
+                f"Año: {year}\n"
                 f"Carpetas revisadas: {result.get('checked')}\n"
                 f"Ya existían: {result.get('already_present')}\n"
                 f"Filas nuevas añadidas ({len(added)}):\n{lines}",
@@ -3617,6 +3760,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Sincronización completada",
+                f"Año: {year}\n"
                 f"Carpetas revisadas: {result.get('checked')}\n"
                 "No se encontró ninguna carpeta nueva — el Excel ya estaba al día.",
             )
@@ -3624,6 +3768,10 @@ class MainWindow(QMainWindow):
     def _refresh_finished(self, success: bool, message: str, stats: dict) -> None:
         self.refresh_button.setEnabled(True)
         self.projects_page.set_processing(False)
+        self._refresh_elapsed_timer.stop()
+        self._refresh_started_at = None
+        self.refresh_progress.setVisible(False)
+        self.refresh_status_label.setVisible(False)
         if success:
             self.statusBar().showMessage("Actualización completada", 5000)
             if stats:

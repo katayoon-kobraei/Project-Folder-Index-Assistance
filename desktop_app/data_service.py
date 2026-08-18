@@ -307,6 +307,25 @@ def project_info_rows() -> list[dict]:
     return _project_info_cache["rows"]
 
 
+def project_info_file_path(year: int) -> str:
+    """Full path to {project_info_dir}/{year}.xlsx — the exact file a
+    given year's project_info rows are read from AND written back into
+    (see writer.py). Backs the "Abrir Excel" buttons on the Proyectos
+    Info page (one per year) and its detail page (one per project, for
+    the year that row's own data lives in).
+
+    Raises FileNotFoundError if project_info_dir isn't configured, or
+    that year's file doesn't exist — the same failure mode as every
+    other project_info_dir access in this module (see _project_info_dir/
+    project_info_rows), so callers can show it as a plain error dialog
+    the same way."""
+    dir_path = _project_info_dir()
+    file_path = Path(dir_path) / f"{year}.xlsx"
+    if not file_path.exists():
+        raise FileNotFoundError(f"No se encuentra el archivo de {year}: {file_path}")
+    return str(file_path)
+
+
 def project_info_detail(item_id: int) -> dict | None:
     for row in project_info_rows():
         if row["id"] == item_id:
