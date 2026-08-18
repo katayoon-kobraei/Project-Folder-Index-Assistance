@@ -100,10 +100,40 @@ def _open_year_file(dir_path: str, year: int):
     return file_path, openpyxl.load_workbook(str(file_path))
 
 
+def _ensure_column(ws, header_to_col: dict, header: str) -> int:
+    """The 1-based column index for `header` in `ws`'s header row (row
+    1) — creating it (appending one past the current last column, with
+    `header` written into row 1) if it doesn't exist yet, instead of
+    silently refusing to save that field at all. Callers only call this
+    when there's an actual non-blank value to write (see the "value in
+    (None, '')" check at each call site) — a blank field on a row still
+    just gets skipped for a column that doesn't exist, same as before,
+    so opening/saving a new project doesn't spray a bunch of new empty
+    columns across an older year's sheet for every field left untouched.
+
+    This matters concretely for "LISTADO DE EMPLEADOS": confirmed by
+    directly inspecting the real uploaded master workbook that NONE of
+    its 2024/2025/2026 sheets actually have that column, despite an
+    earlier assumption in this codebase that 2026 did — so every save
+    of the employee checklist was silently a no-op, the exact bug
+    reported ("when i tick people... it should add the person name to
+    the project info xlsx file"). Auto-creating the column (only when
+    there's really something to put in it) is what actually fixes that."""
+    col = header_to_col.get(header)
+    if col is not None:
+        return col
+    col = ws.max_column + 1
+    ws.cell(row=1, column=col).value = header
+    header_to_col[header] = col
+    return col
+
+
 def update_project_info_row(dir_path: str, year: int, row_number: int, updates: dict) -> None:
     """Write `updates` (field key -> new value, plain strings — empty
     string clears the cell) into row `row_number` of `{dir_path}/
-    {year}.xlsx`.
+    {year}.xlsx`. A column that doesn't exist yet in that particular
+    sheet is created on the fly (see _ensure_column) rather than the
+    write being silently dropped.
 
     Raises FileNotFoundError if the year file doesn't exist, and
     ValueError if a date field's value isn't a valid dd/mm/yyyy string."""
@@ -120,7 +150,9 @@ def update_project_info_row(dir_path: str, year: int, row_number: int, updates: 
             header = KEY_TO_HEADER[key]
             col = header_to_col.get(header)
             if col is None:
-                continue  # this file's sheet doesn't have that column at all
+                if value in (None, ""):
+                    continue  # nothing to write, and nothing worth creating a column for
+                col = _ensure_column(ws, header_to_col, header)
             # NOT ws.cell(row, col, value=value) — openpyxl's cell()
             # treats value=None as "no value passed" and leaves the
             # existing content alone, so clearing a field silently did
@@ -136,9 +168,11 @@ def update_project_info_row(dir_path: str, year: int, row_number: int, updates: 
 def append_project_info_row(dir_path: str, year: int, values: dict) -> int:
     """Add a brand-new row at the end of `{dir_path}/{year}.xlsx`,
     writing `values` (same field-key -> value shape as
-    update_project_info_row) into the matching columns — any column not
-    present in `values`, or not part of this particular sheet at all, is
-    simply left blank. Returns the new row's 1-based row_number.
+    update_project_info_row) into the matching columns. A blank field
+    is simply left blank rather than creating a column for it; a field
+    with an actual value, whose column doesn't exist in this sheet yet,
+    gets that column created on the fly instead (see _ensure_column).
+    Returns the new row's 1-based row_number.
 
     Raises FileNotFoundError if the year file doesn't exist, ValueError
     if a date field isn't a valid dd/mm/yyyy string, and ValueError if
@@ -159,7 +193,9 @@ def append_project_info_row(dir_path: str, year: int, values: dict) -> int:
             header = KEY_TO_HEADER[key]
             col = header_to_col.get(header)
             if col is None:
-                continue
+                if value in (None, ""):
+                    continue
+                col = _ensure_column(ws, header_to_col, header)
             ws.cell(row=row_number, column=col).value = value
 
         wb.save(str(file_path))

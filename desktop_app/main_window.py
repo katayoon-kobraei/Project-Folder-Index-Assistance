@@ -27,12 +27,16 @@ import re
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices
+from PySide6.QtCore import Qt, QSize, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QIcon, QImage, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
+    QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -71,6 +75,10 @@ STAGE_LABELS = {
     "crawling": "Recorriendo carpetas...",
     "resolving_projects": "Agrupando proyectos...",
     "detecting_locations": "Detectando ubicaciones...",
+    # Only reached in shared index mode (see config.example.yaml) — the
+    # builder PC copying its just-finished local index to the shared
+    # server path so every other PC picks it up.
+    "publishing": "Publicando índice compartido...",
 }
 PHASE_LABELS = {"direccion_obra": "Dirección de obra"}
 STATUS_LABELS = {
@@ -122,7 +130,14 @@ class RefreshWorker(QThread):
         try:
             started = data_service.start_refresh()
             if not started:
-                self.finished_with_result.emit(False, "Ya hay una actualización en curso.", {})
+                # start_refresh always sets a specific reason for why it
+                # refused — a real "already running" on this PC, or (in
+                # shared index mode, see config.example.yaml) this PC
+                # isn't the designated builder, or another PC currently
+                # holds the shared-index lock. Read it back instead of
+                # assuming it's always the "already running" case.
+                reason = data_service.refresh_status().get("error") or "Ya hay una actualización en curso."
+                self.finished_with_result.emit(False, reason, {})
                 return
             last_stage = None
             while True:
@@ -139,6 +154,25 @@ class RefreshWorker(QThread):
             else:
                 self.finished_with_result.emit(True, "Actualización completada.", status.get("stats") or {})
         except Exception as exc:  # pragma: no cover - defensive
+            self.finished_with_result.emit(False, str(exc), {})
+
+
+class SyncTrabajosWorker(QThread):
+    """Runs data_service.sync_new_projects_from_trabajos() off the GUI
+    thread — a plain folder scan + a handful of xlsx appends, nowhere
+    near as slow as a full P: crawl, but still worth not blocking the
+    window on since TRABAJOS <year> lives on the network drive too.
+    Unlike RefreshWorker there's no polling: sync_new_projects_from_
+    trabajos() runs to completion and returns its own result dict
+    directly, no background-thread/status-polling machinery involved."""
+
+    finished_with_result = Signal(bool, str, dict)
+
+    def run(self) -> None:
+        try:
+            result = data_service.sync_new_projects_from_trabajos()
+            self.finished_with_result.emit(True, "", result)
+        except Exception as exc:
             self.finished_with_result.emit(False, str(exc), {})
 
 
@@ -809,6 +843,320 @@ START_DATE_FIELD = ("Fecha del proyecto", "start_date")
 # hide-when-blank PROJECT_INFO_FIELDS below.
 ALWAYS_SHOWN_FIELDS = [EMPLOYEE_LIST_FIELD, START_DATE_FIELD]
 
+# The company's employee roster — full name, a short "match" name (see
+# _row_has_employee), and a small photo file under desktop_app/assets/
+# employees/. Backs the read-only avatar row on the project card
+# (ProyectosInfoDetailPage.load), the tick/untick checklist in
+# ProyectosInfoDetailPage/ProyectosInfoNewPage, AND ConfiguracionPage,
+# where the roster itself is managed (add/rename/change photo/delete).
+#
+# Persisted as JSON at _ROSTER_FILE, NOT a hardcoded constant — it used
+# to be, but that meant adding/removing an employee required editing
+# source code. load_employees_roster() re-reads that file fresh on
+# every call (no in-memory cache): it's a handful of small dict entries,
+# cheap enough to not need one, and always reflects whatever
+# ConfiguracionPage just saved without any extra "please refresh"
+# wiring between pages.
+#
+# "Lista de empleados" in the source workbook is STILL just one
+# free-text cell per project row (see reader.py/writer.py — this roster
+# doesn't change that storage format at all). It's only used to
+# interpret and produce that text: on load, an employee counts as "on
+# this project" if their match-name shows up as whole word(s) somewhere
+# in the cell (see _row_has_employee); on save, the ticked employees'
+# full names are joined back into one comma-separated string. A project
+# whose employee_list was typed by hand before this feature existed
+# (e.g. just "Fernando, Milagros") still auto-ticks the right people —
+# matching only needs the short first-name form, not the full name with
+# surnames, since that's what's realistically been typed in by hand.
+_EMPLOYEES_DIR = Path(__file__).parent / "assets" / "employees"
+_ROSTER_FILE = _EMPLOYEES_DIR / "roster.json"
+
+# Seeds _ROSTER_FILE the very first time the app runs against it (e.g.
+# right after upgrading from the old hardcoded-EMPLOYEES version) — not
+# read from again afterward, since load_employees_roster() only falls
+# back to this when the JSON file is missing or unreadable.
+_DEFAULT_EMPLOYEES = [
+    {"name": "Guillermo Gea Marco", "match_name": "Guillermo", "photo": "guillermo_gea_marco.png"},
+    {"name": "Fernando García Boullón", "match_name": "Fernando", "photo": "fernando_garcia_boullon.png"},
+    {"name": "Stephania Terrosa Sayago", "match_name": "Stephania", "photo": "stephania_terrosa_sayago.png"},
+    {"name": "Juan Carlos Anderson Morata", "match_name": "Juan Carlos", "photo": "juan_carlos_anderson_morata.png"},
+    {"name": "Katerine Serrano Barbosa", "match_name": "Katerine", "photo": "katerine_serrano_barbosa.png"},
+    {"name": "Francisco Vargas Zamora", "match_name": "Francisco", "photo": "francisco_vargas_zamora.png"},
+    {"name": "Milagros Llopis Pérez", "match_name": "Milagros", "photo": "milagros_llopis_perez.png"},
+    {"name": "Consuelo", "match_name": "Consuelo", "photo": "consuelo.png"},
+    {"name": "Daniel", "match_name": "Daniel", "photo": "daniel.png"},
+]
+
+
+def load_employees_roster() -> list[dict]:
+    """Every roster entry as {"name", "match_name", "photo"}, freshly
+    read from _ROSTER_FILE (see module comment above for why this isn't
+    cached). Seeds the file from _DEFAULT_EMPLOYEES on first run, or
+    falls back to those same defaults (without persisting them) if the
+    file exists but is somehow corrupt — either way this never raises,
+    since a broken roster file shouldn't take down the whole app."""
+    if not _ROSTER_FILE.exists():
+        save_employees_roster(_DEFAULT_EMPLOYEES)
+        return [dict(e) for e in _DEFAULT_EMPLOYEES]
+    try:
+        return json.loads(_ROSTER_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return [dict(e) for e in _DEFAULT_EMPLOYEES]
+
+
+def save_employees_roster(roster: list[dict]) -> None:
+    _EMPLOYEES_DIR.mkdir(parents=True, exist_ok=True)
+    _ROSTER_FILE.write_text(
+        json.dumps(roster, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _slugify_employee_name(name: str) -> str:
+    """Filesystem-safe base filename for a new employee's photo, e.g.
+    "Juan Pérez" -> "juan_perez" — used only when adding someone new or
+    replacing their photo (see _save_employee_photo); existing entries
+    keep whatever filename they already have in the roster JSON."""
+    import unicodedata
+
+    normalized = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
+    slug = "".join(ch if ch.isalnum() else "_" for ch in normalized.lower())
+    while "__" in slug:
+        slug = slug.replace("__", "_")
+    return slug.strip("_") or "empleado"
+
+
+# Stored (saved-to-disk) avatar size — deliberately bigger than any size
+# actually displayed on screen (_circular_avatar_pixmap's callers all
+# pass 28-40px) so a photo still looks sharp if a bigger display size is
+# ever used later; downscaling for display happens on the fly from this.
+_AVATAR_EXPORT_SIZE = 512
+
+
+def _save_employee_photo(source_path: str, name: str, existing_photo: str | None = None) -> str:
+    """Turn whatever image a QFileDialog handed back at `source_path`
+    into a square-cropped, fixed-size PNG saved into _EMPLOYEES_DIR, and
+    return the filename to store in the roster JSON's "photo" field.
+    Pure Qt (QImage crop + scale + save) — no Pillow, which isn't a
+    dependency of this app anywhere else.
+
+    If `existing_photo` is given (replacing an existing employee's
+    picture), the SAME filename is reused, so the roster entry's
+    "photo" field never has to change and every other already-open page
+    referencing that filename picks up the new picture next time it
+    repaints. Otherwise a fresh filename is derived from `name` (via
+    _slugify_employee_name), with a numeric suffix appended if that slug
+    is already taken by a different employee's photo file.
+
+    Raises ValueError if the file isn't a loadable image or can't be
+    saved (e.g. a permissions problem) — callers show that to the user
+    rather than silently failing."""
+    image = QImage(source_path)
+    if image.isNull():
+        raise ValueError(f"No se pudo abrir la imagen: {source_path}")
+
+    side = min(image.width(), image.height())
+    x = (image.width() - side) // 2
+    y = (image.height() - side) // 2
+    cropped = image.copy(x, y, side, side)
+    scaled = cropped.scaled(
+        _AVATAR_EXPORT_SIZE,
+        _AVATAR_EXPORT_SIZE,
+        Qt.KeepAspectRatio,
+        Qt.SmoothTransformation,
+    )
+
+    _EMPLOYEES_DIR.mkdir(parents=True, exist_ok=True)
+    if existing_photo:
+        filename = existing_photo
+    else:
+        base = _slugify_employee_name(name)
+        taken_filenames = {employee["photo"] for employee in load_employees_roster()}
+        filename = f"{base}.png"
+        suffix = 2
+        while filename in taken_filenames:
+            filename = f"{base}_{suffix}.png"
+            suffix += 1
+
+    if not scaled.save(str(_EMPLOYEES_DIR / filename), "PNG"):
+        raise ValueError(f"No se pudo guardar la foto: {filename}")
+
+    # A replaced photo keeps its old filename (see above), so the
+    # circular-avatar cache below (keyed by "filename:size") would
+    # otherwise go on serving the OLD picture under that same key
+    # forever — drop every cached size for this filename so the next
+    # repaint re-decodes the file that was just written.
+    for key in [k for k in _avatar_pixmap_cache if k.startswith(f"{filename}:")]:
+        del _avatar_pixmap_cache[key]
+
+    return filename
+
+
+_avatar_pixmap_cache: dict[str, QPixmap] = {}
+
+
+def _circular_mask_pixmap(source: QPixmap, size: int) -> QPixmap:
+    """A `size`x`size` circularly-masked copy of an already-loaded
+    QPixmap — the actual crop+mask logic shared by _circular_avatar_
+    pixmap (cached, disk-backed roster photos) and the Configuración
+    add/edit dialog's live preview of a photo the user just picked but
+    hasn't saved into the roster yet (nothing to cache there, it's a
+    different image every time the dialog opens)."""
+    if source.isNull():
+        result = QPixmap(size, size)
+        result.fill(Qt.transparent)
+        painter = QPainter(result)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QColor("#dbe3ea"))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(0, 0, size, size)
+        painter.end()
+        return result
+
+    source = source.scaled(
+        size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
+    )
+    # KeepAspectRatioByExpanding can leave one dimension slightly larger
+    # than `size` — center-crop back down to an exact square before
+    # masking, or the mask circle would clip unevenly.
+    if source.width() != size or source.height() != size:
+        x = max(0, (source.width() - size) // 2)
+        y = max(0, (source.height() - size) // 2)
+        source = source.copy(x, y, size, size)
+
+    result = QPixmap(size, size)
+    result.fill(Qt.transparent)
+    painter = QPainter(result)
+    painter.setRenderHint(QPainter.Antialiasing)
+    clip_path = QPainterPath()
+    clip_path.addEllipse(0, 0, size, size)
+    painter.setClipPath(clip_path)
+    painter.drawPixmap(0, 0, source)
+    painter.end()
+    return result
+
+
+def _circular_avatar_pixmap(photo_filename: str, size: int = 32) -> QPixmap:
+    """A `size`x`size` circularly-masked QPixmap for one roster photo —
+    cached by (filename, size) since this gets called for the same
+    handful of employees over and over (every project card load, every
+    row of the edit checklist), and re-decoding + re-masking the same
+    PNG each time would be wasteful for no benefit (the roster photos
+    only change when Configuración explicitly saves a new one, which
+    busts this cache itself — see _save_employee_photo)."""
+    cache_key = f"{photo_filename}:{size}"
+    cached = _avatar_pixmap_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    source = QPixmap(str(_EMPLOYEES_DIR / photo_filename))
+    result = _circular_mask_pixmap(source, size)
+    _avatar_pixmap_cache[cache_key] = result
+    return result
+
+
+def _row_has_employee(employee_list_text: str | None, match_name: str) -> bool:
+    """Whether a roster entry (identified by its short `match_name`,
+    e.g. "Fernando" or "Juan Carlos") shows up in this project's
+    free-text employee_list cell — matched on WHOLE words (see _words),
+    same reasoning as the company search fix elsewhere in this file: a
+    plain substring check would let e.g. "Ana" match inside "Mariana".
+    For a two-word match_name ("Juan Carlos") every one of its words
+    has to be present, not just one of them."""
+    text_words = _words(employee_list_text or "")
+    match_words = _words(match_name)
+    return bool(match_words) and match_words.issubset(text_words)
+
+
+def _build_employee_avatar_row(employee_list_text: str | None) -> QWidget:
+    """Read-only row of small circular avatar icons — one per roster
+    employee whose match-name is found in `employee_list_text` (see
+    _row_has_employee) — replacing what used to be the raw
+    employee_list text on the project card. Hovering an icon shows that
+    person's full name as a tooltip. Returns a widget containing a
+    single muted placeholder label instead when nobody matches, so the
+    card still shows SOMETHING in that slot (same "Sin datos todavía"
+    wording the old plain-text version used).
+
+    Reads load_employees_roster() fresh (not a frozen list) so a
+    project opened right after adding/renaming/deleting someone in
+    Configuración already reflects that change, no restart needed."""
+    row = QWidget()
+    layout = QHBoxLayout(row)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(6)
+
+    matched = [
+        (employee["name"], employee["photo"]) for employee in load_employees_roster()
+        if _row_has_employee(employee_list_text, employee["match_name"])
+    ]
+    if not matched:
+        placeholder = QLabel("Sin datos todavía")
+        placeholder.setObjectName("MutedText")
+        layout.addWidget(placeholder)
+        layout.addStretch()
+        return row
+
+    for name, photo in matched:
+        avatar = QLabel()
+        avatar.setPixmap(_circular_avatar_pixmap(photo, 32))
+        avatar.setFixedSize(32, 32)
+        avatar.setToolTip(name)
+        layout.addWidget(avatar)
+    layout.addStretch()
+    return row
+
+
+def _build_employee_checklist() -> tuple[QWidget, dict[str, QCheckBox]]:
+    """One QCheckBox per current roster entry (see load_employees_
+    roster — always the LATEST saved roster, not a frozen snapshot),
+    each showing that person's avatar as its icon plus their full name
+    as its label — the tick/untick control used in both
+    ProyectosInfoDetailPage's employees panel and ProyectosInfoNewPage,
+    replacing the old free-text "Lista de empleados" box in both
+    places. Returns the container widget plus a {full_name: checkbox}
+    dict so the caller can read/set which boxes are ticked (see
+    _row_has_employee for how a saved employee_list string maps back to
+    which boxes should start ticked)."""
+    container = QWidget()
+    layout = QVBoxLayout(container)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(6)
+
+    checkboxes: dict[str, QCheckBox] = {}
+    for employee in load_employees_roster():
+        checkbox = QCheckBox(employee["name"])
+        checkbox.setIcon(QIcon(_circular_avatar_pixmap(employee["photo"], 28)))
+        checkbox.setIconSize(QSize(28, 28))
+        checkbox.setCursor(Qt.PointingHandCursor)
+        layout.addWidget(checkbox)
+        checkboxes[employee["name"]] = checkbox
+    return container, checkboxes
+
+
+def _employee_list_text_from_checkboxes(checkboxes: dict[str, QCheckBox]) -> str | None:
+    """The comma-separated employee_list string to save, built from
+    whichever checkboxes are currently ticked — full names, e.g.
+    "Guillermo Gea Marco, Daniel", not just first names, so the saved
+    text is unambiguous even though _row_has_employee only needs the
+    short first-name form to re-recognize it later."""
+    ticked = [name for name in checkboxes if checkboxes[name].isChecked()]
+    return ", ".join(ticked) or None
+
+
+def _set_checkboxes_from_employee_list_text(
+    checkboxes: dict[str, QCheckBox], employee_list_text: str | None
+) -> None:
+    """Ticks exactly the checkboxes whose roster entry matches
+    `employee_list_text` (see _row_has_employee) — used to initialize
+    the checklist from a project's already-saved (or hand-typed legacy)
+    employee_list value when entering edit mode / opening the new-
+    project form."""
+    for employee in load_employees_roster():
+        checkbox = checkboxes.get(employee["name"])
+        if checkbox is not None:
+            checkbox.setChecked(_row_has_employee(employee_list_text, employee["match_name"]))
+
 # Fields shown in the "Editar" form — a fixed, narrower list than
 # PROJECT_INFO_FIELDS above, matching the columns the real 2024/2025/
 # 2026 files actually have today (see reader.py's FIELD_MAP). Unlike the
@@ -825,7 +1173,10 @@ EDIT_TEXT_FIELDS = [
     ("Promotor", "client"),
 ]
 EDIT_MULTILINE_FIELDS = [
-    ("Lista de empleados", "employee_list"),
+    # "Lista de empleados" used to be here as a free-text box — it's now
+    # a dedicated tick/untick checklist (see _build_employee_checklist),
+    # built and wired into the edit forms separately, not through this
+    # generic per-field loop.
 ]
 # The 4 columns constrained to a fixed set of categories in the source
 # workbook (see reader.CATEGORY_OPTIONS) — rendered as radio buttons
@@ -947,6 +1298,7 @@ class ProyectosInfoPage(QWidget):
     company_opened = Signal(int, str)  # (year, company)
     project_info_opened = Signal(int)  # a matched row's own id, opened directly
     new_project_requested = Signal()
+    sync_trabajos_requested = Signal()
 
     _ALL_YEARS_LABEL = "Todos los años"
     _ALL_CATEGORY_LABEL = "Todos"
@@ -962,6 +1314,17 @@ class ProyectosInfoPage(QWidget):
         heading.setObjectName("SectionTitle")
         heading_row.addWidget(heading)
         heading_row.addStretch()
+        # Distinct from the topbar's "Actualizar" button (which rebuilds
+        # the crawled P: index, db_path) — this one scans TRABAJOS
+        # <año actual> on P: for job/site folders that don't have a
+        # matching NOMBRE row yet in the current year's xlsx, and appends
+        # one for each (see src/project_info/sync_trabajos.py). Never
+        # touches the crawled index at all.
+        self.sync_trabajos_button = QPushButton("⟳  Sincronizar carpetas nuevas")
+        self.sync_trabajos_button.setObjectName("SecondaryButton")
+        self.sync_trabajos_button.setCursor(Qt.PointingHandCursor)
+        self.sync_trabajos_button.clicked.connect(self.sync_trabajos_requested.emit)
+        heading_row.addWidget(self.sync_trabajos_button)
         self.new_project_button = QPushButton("+  Nuevo proyecto")
         self.new_project_button.setObjectName("PrimaryButton")
         self.new_project_button.setCursor(Qt.PointingHandCursor)
@@ -1035,6 +1398,24 @@ class ProyectosInfoPage(QWidget):
             combo.currentIndexChanged.connect(self._apply_filter)
             self._category_filters[key] = combo
             category_row.addWidget(combo)
+
+        # Employee filter — a plain dropdown of names (see
+        # _rebuild_employee_filter_options), same "Todos" + one option
+        # per value shape as the 4 category filters above, but backed
+        # by the live roster (load_employees_roster) instead of a fixed
+        # CATEGORY_OPTIONS list, and matched against a row's free-text
+        # employee_list cell via _row_has_employee rather than an exact
+        # field comparison — see _row_matches_active_filters.
+        employee_label = QLabel("Empleado:")
+        employee_label.setObjectName("MutedText")
+        category_row.addWidget(employee_label)
+        self.employee_filter = QComboBox()
+        self.employee_filter.setMinimumWidth(170)
+        self.employee_filter.currentIndexChanged.connect(self._apply_filter)
+        self._employee_filter_match_names: dict[str, str] = {}
+        self._rebuild_employee_filter_options()
+        category_row.addWidget(self.employee_filter)
+
         category_row.addStretch()
         self.category_panel.setVisible(False)
         outer.addWidget(self.category_panel)
@@ -1094,6 +1475,27 @@ class ProyectosInfoPage(QWidget):
         # once and reusing it removes that repeat work entirely.
         self._row_words_cache: dict[int, frozenset[str]] = {}
 
+    def _rebuild_employee_filter_options(self) -> None:
+        """Repopulates the employee filter dropdown from the CURRENT
+        roster (load_employees_roster re-reads roster.json fresh every
+        call) — called once in __init__ and again on every refresh()
+        (every visit to this page), so someone added/renamed/removed
+        via Configuración shows up here without restarting the app.
+        Keeps the current selection if that exact name is still in the
+        roster; otherwise resets to "Todos" rather than silently
+        leaving a filter selected for a name that no longer exists."""
+        previous_selection = self.employee_filter.currentText()
+        self.employee_filter.blockSignals(True)
+        self.employee_filter.clear()
+        self.employee_filter.addItem(self._ALL_CATEGORY_LABEL)
+        self._employee_filter_match_names = {}
+        for employee in load_employees_roster():
+            self.employee_filter.addItem(employee["name"])
+            self._employee_filter_match_names[employee["name"]] = employee["match_name"]
+        index = self.employee_filter.findText(previous_selection)
+        self.employee_filter.setCurrentIndex(index if index >= 0 else 0)
+        self.employee_filter.blockSignals(False)
+
     def refresh(self) -> None:
         """Called every time this page is navigated to — NOT just when
         the underlying data actually changed. data_service.
@@ -1102,6 +1504,11 @@ class ProyectosInfoPage(QWidget):
         comparing by identity (`is`) below skips rebuilding ~370+ tree
         items and status pills on every single visit to this page, only
         doing it when there's something new to show."""
+        # Independent of the row-data caching below — the roster can
+        # change (via Configuración) even when project_info_rows()
+        # hasn't, so this always re-reads it fresh on every visit.
+        self._rebuild_employee_filter_options()
+
         try:
             rows = data_service.project_info_rows()
             error = None
@@ -1251,6 +1658,8 @@ class ProyectosInfoPage(QWidget):
             1 for combo in self._category_filters.values()
             if combo.currentText() != self._ALL_CATEGORY_LABEL
         )
+        if self.employee_filter.currentText() != self._ALL_CATEGORY_LABEL:
+            active += 1
         arrow = "▴" if self.filters_toggle.isChecked() else "▾"
         label = f"Filtros ({active})" if active else "Filtros"
         self.filters_toggle.setText(f"{arrow}  {label}")
@@ -1318,13 +1727,23 @@ class ProyectosInfoPage(QWidget):
             self._row_words_cache[key] = cached
         return cached
 
-    def _row_matches_categories(self, row: dict) -> bool:
-        """Whether this one row satisfies every ACTIVE category filter
-        at once (Estado/Tipo/Subtipo1/Subtipo2) — a filter left on
-        "Todos" is skipped, not treated as "must be blank"."""
+    def _row_matches_active_filters(self, row: dict) -> bool:
+        """Whether this one row satisfies every ACTIVE filter at once —
+        the 4 fixed categories (Estado/Tipo/Subtipo1/Subtipo2), each an
+        exact-value match, PLUS the employee filter, matched the same
+        way "Lista de empleados" is read everywhere else (whole-word
+        match_name lookup via _row_has_employee, not an exact string
+        comparison — a row's employee_list is free text). A filter left
+        on "Todos" is skipped entirely, not treated as "must be
+        blank"."""
         for key, combo in self._category_filters.items():
             selected = combo.currentText()
             if selected != self._ALL_CATEGORY_LABEL and (row.get(key) or "") != selected:
+                return False
+        selected_employee = self.employee_filter.currentText()
+        if selected_employee != self._ALL_CATEGORY_LABEL:
+            match_name = self._employee_filter_match_names.get(selected_employee)
+            if match_name is None or not _row_has_employee(row.get("employee_list"), match_name):
                 return False
         return True
 
@@ -1377,7 +1796,7 @@ class ProyectosInfoPage(QWidget):
         any_category_active = any(
             combo.currentText() != self._ALL_CATEGORY_LABEL
             for combo in self._category_filters.values()
-        )
+        ) or self.employee_filter.currentText() != self._ALL_CATEGORY_LABEL
         total_visible = 0
 
         for i in range(self.tree.topLevelItemCount()):
@@ -1395,7 +1814,7 @@ class ProyectosInfoPage(QWidget):
                     company, company_rows, filter_words
                 )
                 category_ok = not any_category_active or any(
-                    self._row_matches_categories(row) for row in company_rows
+                    self._row_matches_active_filters(row) for row in company_rows
                 )
                 matches = text_ok and category_ok
 
@@ -1417,7 +1836,7 @@ class ProyectosInfoPage(QWidget):
                     matched_count = 0
                     total = len(company_rows)
                     for k, row in enumerate(company_rows):
-                        row_visible = self._row_fully_matches(row, filter_words) and self._row_matches_categories(row)
+                        row_visible = self._row_fully_matches(row, filter_words) and self._row_matches_active_filters(row)
                         child.child(k).setHidden(not row_visible)
                         if row_visible:
                             matched_count += 1
@@ -1649,6 +2068,16 @@ class ProyectosInfoDetailPage(QWidget):
         self.categories_panel = self._build_categories_panel()
         content_layout.addWidget(self.categories_panel)
 
+        # Same "always interactive, saves instantly" treatment as
+        # categories_panel above — NOT the "Editar" + "Guardar" batch
+        # flow the other fields use. Ticking/unticking one employee here
+        # writes straight into that row's LISTADO DE EMPLEADOS cell right
+        # away (see _on_employee_toggled), per explicit request: ticking
+        # someone should show up in the xlsx immediately, not wait for a
+        # separate save step.
+        self.employees_panel = self._build_employees_panel()
+        content_layout.addWidget(self.employees_panel)
+
         self.edit_panel = self._build_edit_panel()
         self.edit_panel.setVisible(False)
         content_layout.addWidget(self.edit_panel)
@@ -1763,6 +2192,81 @@ class ProyectosInfoDetailPage(QWidget):
         # category radio stay in sync with what's now actually on disk.
         self.load(self._item_id)
 
+    def _build_employees_panel(self) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("Panel")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(22, 20, 22, 20)
+        layout.setSpacing(10)
+
+        title = QLabel("Lista de empleados:")
+        title.setObjectName("MetricTitle")
+        layout.addWidget(title)
+
+        # Reserves the slot; the actual checkboxes are (re)built by
+        # _rebuild_employee_checklist, called here once and again on
+        # every load() — see that method for why.
+        self._employee_checklist_slot = QVBoxLayout()
+        layout.addLayout(self._employee_checklist_slot)
+        self._employee_checkboxes: dict[str, QCheckBox] = {}
+        self._rebuild_employee_checklist()
+
+        return panel
+
+    def _rebuild_employee_checklist(self) -> None:
+        """Rebuilds the tick/untick checklist from the CURRENT roster
+        (load_employees_roster() re-reads roster.json fresh every
+        call) — called from load() every time a project is opened, so
+        someone added/renamed/removed via Configuración shows up here
+        without restarting the app. The previous checkbox widgets (if
+        any) are torn down first; load() re-ticks the right boxes for
+        this specific row right after calling this."""
+        while self._employee_checklist_slot.count():
+            taken = self._employee_checklist_slot.takeAt(0)
+            widget = taken.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        checklist_widget, self._employee_checkboxes = _build_employee_checklist()
+        self._employee_checklist_slot.addWidget(checklist_widget)
+        for name, checkbox in self._employee_checkboxes.items():
+            checkbox.toggled.connect(
+                lambda checked, name=name: self._on_employee_toggled(name, checked)
+            )
+
+    def _sync_employee_checkboxes(self, data: dict | None) -> None:
+        """Ticks exactly the checkboxes matching this row's current
+        employee_list value — WITHOUT triggering _on_employee_toggled
+        (signals blocked), same reasoning as _sync_category_radios:
+        this reflects already-saved state, it isn't a user edit to
+        write back."""
+        employee_list_text = data.get("employee_list") if data else None
+        for checkbox in self._employee_checkboxes.values():
+            checkbox.blockSignals(True)
+        _set_checkboxes_from_employee_list_text(self._employee_checkboxes, employee_list_text)
+        for checkbox in self._employee_checkboxes.values():
+            checkbox.blockSignals(False)
+
+    def _on_employee_toggled(self, name: str, checked: bool) -> None:
+        if self._item_id is None:
+            return
+        # Recomputed from ALL currently ticked boxes (not just this one
+        # name added/removed from the old text) — the same approach
+        # _employee_list_text_from_checkboxes always uses, so the saved
+        # cell is always exactly "whoever's ticked right now", never
+        # drifting from what's shown on screen.
+        new_text = _employee_list_text_from_checkboxes(self._employee_checkboxes)
+        try:
+            data_service.update_project_info(self._item_id, {"employee_list": new_text})
+        except Exception as exc:
+            QMessageBox.critical(self, "No se pudo guardar", str(exc))
+            self._sync_employee_checkboxes(self._data)  # revert to the last saved state
+            return
+        # Full reload — keeps the card's avatar-icon glance row (see
+        # _build_employee_avatar_row) in sync with what's now actually
+        # on disk, same as every other instant-save field on this page.
+        self.load(self._item_id)
+
     def _build_edit_panel(self) -> QFrame:
         panel = QFrame()
         panel.setObjectName("Panel")
@@ -1795,6 +2299,11 @@ class ProyectosInfoDetailPage(QWidget):
             layout.addWidget(field, row, 1)
             self._edit_multiline[key] = field
             row += 1
+
+        # "Lista de empleados" is NOT in this batch form — it's its own
+        # always-visible, instant-save panel (see _build_employees_panel
+        # / _on_employee_toggled), same treatment as the category radios
+        # above it, so it's intentionally absent here.
 
         button_row = QHBoxLayout()
         button_row.addStretch()
@@ -1846,10 +2355,18 @@ class ProyectosInfoDetailPage(QWidget):
         self.status_pill.style().polish(self.status_pill)
 
         self._sync_category_radios(data)
+        # Rebuilt from the current roster on every load (not just once
+        # in __init__) — see _rebuild_employee_checklist — so someone
+        # added/renamed/removed in Configuración shows up here right
+        # away; _sync_employee_checkboxes then ticks the right boxes
+        # for THIS row against those freshly-built checkboxes.
+        self._rebuild_employee_checklist()
+        self._sync_employee_checkboxes(data)
 
         self._clear_card()
         self.card.setVisible(True)
         self.categories_panel.setVisible(True)
+        self.employees_panel.setVisible(True)
         row_idx = 0
 
         # Always shown first, even with no data yet — see
@@ -1859,12 +2376,17 @@ class ProyectosInfoDetailPage(QWidget):
             label = QLabel(label_text + ":")
             label.setObjectName("MetricTitle")
             label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-            value_label = QLabel(str(value) if value not in (None, "") else "Sin datos todavía")
-            value_label.setWordWrap(True)
-            if value in (None, ""):
-                value_label.setObjectName("MutedText")
             self.card_layout.addWidget(label, row_idx, 0)
-            self.card_layout.addWidget(value_label, row_idx, 1)
+            if key == "employee_list":
+                # Small circular avatar icons instead of the raw
+                # free-text cell — see _build_employee_avatar_row.
+                self.card_layout.addWidget(_build_employee_avatar_row(value), row_idx, 1)
+            else:
+                value_label = QLabel(str(value) if value not in (None, "") else "Sin datos todavía")
+                value_label.setWordWrap(True)
+                if value in (None, ""):
+                    value_label.setObjectName("MutedText")
+                self.card_layout.addWidget(value_label, row_idx, 1)
             row_idx += 1
 
         for label_text, key in PROJECT_INFO_FIELDS:
@@ -1892,13 +2414,15 @@ class ProyectosInfoDetailPage(QWidget):
         for _label, key in EDIT_MULTILINE_FIELDS:
             self._edit_multiline[key].setPlainText(data.get(key) or "")
 
-        # categories_panel stays out of this mode entirely — it saves
-        # each field the instant you click it (see
-        # _on_category_toggled), so it's hidden alongside `card` while
-        # there's a batch of OTHER unsaved edits in progress here, to
-        # avoid any confusion about what's saved and what isn't.
+        # categories_panel AND employees_panel both stay out of this
+        # mode entirely — they each save the instant you click/tick
+        # something (see _on_category_toggled / _on_employee_toggled),
+        # so they're hidden alongside `card` while there's a batch of
+        # OTHER unsaved edits in progress here, to avoid any confusion
+        # about what's saved and what isn't.
         self.card.setVisible(False)
         self.categories_panel.setVisible(False)
+        self.employees_panel.setVisible(False)
         self.status_pill.setVisible(False)
         self.edit_button.setVisible(False)
         self.edit_panel.setVisible(True)
@@ -1912,6 +2436,9 @@ class ProyectosInfoDetailPage(QWidget):
             updates[key] = self._edit_inputs[key].text().strip() or None
         for _label, key in EDIT_MULTILINE_FIELDS:
             updates[key] = self._edit_multiline[key].toPlainText().strip() or None
+        # employee_list is NOT part of this batch save — see
+        # _on_employee_toggled, it's already saved by the time you get
+        # here.
 
         try:
             data_service.update_project_info(self._item_id, updates)
@@ -2015,6 +2542,26 @@ class ProyectosInfoNewPage(QWidget):
             self._new_multiline[key] = field
             row += 1
 
+        # "Lista de empleados" — same tick/untick roster checklist as
+        # ProyectosInfoDetailPage's Editar panel (see
+        # _build_employee_checklist), not a generic EDIT_MULTILINE_FIELDS
+        # entry.
+        employees_label = QLabel("Lista de empleados:")
+        employees_label.setObjectName("MetricTitle")
+        employees_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        layout.addWidget(employees_label, row, 0)
+        # The checklist widget itself is (re)built by
+        # _rebuild_new_employee_checklist — called once right below and
+        # again from reset() every time this page reopens, so roster
+        # edits made via Configuración show up here without restarting
+        # the app. _employees_form_layout/_employees_form_row remember
+        # where to (re)place it.
+        self._employees_form_layout = layout
+        self._employees_form_row = row
+        self._new_employee_checkboxes: dict[str, QCheckBox] = {}
+        self._rebuild_new_employee_checklist()
+        row += 1
+
         self._new_radio_buttons: dict[str, dict[str | None, QRadioButton]] = {}
         for idx, (label_text, key) in enumerate(EDIT_CATEGORY_FIELDS):
             cat_separator = QFrame()
@@ -2070,6 +2617,22 @@ class ProyectosInfoNewPage(QWidget):
         content_scroll.setWidget(content_widget)
         outer.addWidget(content_scroll, 1)
 
+    def _rebuild_new_employee_checklist(self) -> None:
+        """Rebuilds the tick/untick checklist from the CURRENT roster
+        (see load_employees_roster) at self._employees_form_row, column
+        1 of the form grid — the previous widget (if any) is removed
+        first. Called once during __init__ and again from reset() every
+        time this page is (re)opened, so someone added/renamed/removed
+        via Configuración shows up here without restarting the app."""
+        old_item = self._employees_form_layout.itemAtPosition(self._employees_form_row, 1)
+        if old_item is not None:
+            old_widget = old_item.widget()
+            if old_widget is not None:
+                self._employees_form_layout.removeWidget(old_widget)
+                old_widget.deleteLater()
+        employees_widget, self._new_employee_checkboxes = _build_employee_checklist()
+        self._employees_form_layout.addWidget(employees_widget, self._employees_form_row, 1)
+
     def reset(self) -> None:
         """Blank every field, called each time the page is opened —
         otherwise the previous project's now-created data would still
@@ -2079,6 +2642,7 @@ class ProyectosInfoNewPage(QWidget):
             field.clear()
         for field in self._new_multiline.values():
             field.clear()
+        self._rebuild_new_employee_checklist()
         for buttons in self._new_radio_buttons.values():
             buttons[None].setChecked(True)
         self._new_inputs["project_name"].setFocus()
@@ -2094,6 +2658,9 @@ class ProyectosInfoNewPage(QWidget):
             values[key] = self._new_inputs[key].text().strip() or None
         for _label, key in EDIT_MULTILINE_FIELDS:
             values[key] = self._new_multiline[key].toPlainText().strip() or None
+        values["employee_list"] = _employee_list_text_from_checkboxes(
+            self._new_employee_checkboxes
+        )
         for _label, key in EDIT_CATEGORY_FIELDS:
             selected = None
             for value, button in self._new_radio_buttons[key].items():
@@ -2381,6 +2948,263 @@ def render_graph_html(elements: list[dict]) -> str:
     return html.replace("__CYTOSCAPE_JS__", _CYTOSCAPE_JS)
 
 
+class _EmployeeEditDialog(QDialog):
+    """Add-or-rename-and-photo form used by ConfiguracionPage, for both
+    "+ Añadir empleado" (existing=None) and a card's "Editar" button
+    (existing={"name", "match_name", "photo"}). Doesn't touch the
+    roster or write any photo file itself — the caller reads
+    .result_name / .picked_photo_path after exec() == QDialog.Accepted
+    and does the actual save (see ConfiguracionPage._on_add_clicked /
+    _on_edit_clicked), so cancelling never leaves a half-applied edit."""
+
+    def __init__(self, existing: dict | None = None, parent=None) -> None:
+        super().__init__(parent)
+        self._existing = existing
+        self.picked_photo_path: str | None = None
+        self.setWindowTitle("Editar empleado" if existing else "Añadir empleado")
+        self.setMinimumWidth(340)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 20)
+        layout.setSpacing(14)
+
+        self._preview_label = QLabel()
+        self._preview_label.setFixedSize(96, 96)
+        self._preview_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self._preview_label, alignment=Qt.AlignHCenter)
+        self._refresh_preview()
+
+        photo_button = QPushButton("Cambiar foto…" if existing else "Elegir foto…")
+        photo_button.setObjectName("SecondaryButton")
+        photo_button.setCursor(Qt.PointingHandCursor)
+        photo_button.clicked.connect(self._pick_photo)
+        layout.addWidget(photo_button, alignment=Qt.AlignHCenter)
+
+        name_label = QLabel("Nombre completo:")
+        name_label.setObjectName("MetricTitle")
+        layout.addWidget(name_label)
+        self.name_edit = QLineEdit(existing["name"] if existing else "")
+        self.name_edit.setPlaceholderText("Ej. Juan Pérez García")
+        layout.addWidget(self.name_edit)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Guardar")
+        buttons.button(QDialogButtonBox.Cancel).setText("Cancelar")
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _refresh_preview(self) -> None:
+        if self.picked_photo_path:
+            pixmap = _circular_mask_pixmap(QPixmap(self.picked_photo_path), 96)
+        elif self._existing:
+            pixmap = _circular_avatar_pixmap(self._existing["photo"], 96)
+        else:
+            pixmap = _circular_mask_pixmap(QPixmap(), 96)  # neutral placeholder circle
+        self._preview_label.setPixmap(pixmap)
+
+    def _pick_photo(self) -> None:
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "Elegir foto", "", "Imágenes (*.png *.jpg *.jpeg *.webp *.bmp)"
+        )
+        if not path:
+            return
+        if QImage(path).isNull():
+            QMessageBox.warning(self, "Imagen no válida", "No se pudo abrir esa imagen.")
+            return
+        self.picked_photo_path = path
+        self._refresh_preview()
+
+    def _on_accept(self) -> None:
+        if not self.name_edit.text().strip():
+            QMessageBox.warning(self, "Falta el nombre", "Escribe el nombre del empleado.")
+            return
+        if self._existing is None and not self.picked_photo_path:
+            QMessageBox.warning(self, "Falta la foto", "Elige una foto para el nuevo empleado.")
+            return
+        self.accept()
+
+    @property
+    def result_name(self) -> str:
+        return self.name_edit.text().strip()
+
+
+class ConfiguracionPage(QWidget):
+    """Employee roster admin — add, rename, replace the photo of, or
+    remove someone from the fixed employee list used by "Lista de
+    empleados" everywhere else in the app (see load_employees_roster /
+    save_employees_roster). Every action here saves to roster.json (and
+    the photo file, when relevant) immediately, no separate Guardar
+    step — same instant-save feel as the category radios and employee
+    checklist elsewhere in the app.
+
+    Cards are matched back to their roster entry by `photo` filename
+    (see _save_employee_photo — guaranteed unique per employee), not by
+    list position or object identity, since refresh() rebuilds the grid
+    (and therefore every card's captured `employee` dict) from scratch
+    on every visit.
+
+    Rebuilt from scratch on every refresh() rather than patched in
+    place — the roster is small (a handful to a few dozen people), so
+    this stays simple and always correct rather than being a meaningful
+    performance concern (unlike the ~2400-row Proyectos Info tree)."""
+
+    _CARDS_PER_ROW = 3
+
+    def __init__(self) -> None:
+        super().__init__()
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(26, 22, 26, 26)
+        outer.setSpacing(14)
+
+        top_bar = QHBoxLayout()
+        heading = QLabel("Empleados")
+        heading.setObjectName("SectionTitle")
+        top_bar.addWidget(heading)
+        top_bar.addStretch()
+        add_button = QPushButton("+  Añadir empleado")
+        add_button.setObjectName("PrimaryButton")
+        add_button.setCursor(Qt.PointingHandCursor)
+        add_button.clicked.connect(self._on_add_clicked)
+        top_bar.addWidget(add_button)
+        outer.addLayout(top_bar)
+
+        note = QLabel(
+            "Estas son las personas que se pueden marcar en «Lista de empleados» "
+            "de cada proyecto, en Proyectos Info. Eliminar a alguien de aquí no "
+            "borra nada de los proyectos donde ya estaba marcado — solo deja de "
+            "aparecer como opción para marcar en el futuro."
+        )
+        note.setObjectName("MutedText")
+        note.setWordWrap(True)
+        outer.addWidget(note)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        self._grid_host = QWidget()
+        self._grid = QGridLayout(self._grid_host)
+        self._grid.setContentsMargins(0, 8, 0, 8)
+        self._grid.setSpacing(14)
+        scroll.setWidget(self._grid_host)
+        outer.addWidget(scroll, 1)
+
+    def refresh(self) -> None:
+        while self._grid.count():
+            taken = self._grid.takeAt(0)
+            widget = taken.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        roster = load_employees_roster()
+        for index, employee in enumerate(roster):
+            row, col = divmod(index, self._CARDS_PER_ROW)
+            self._grid.addWidget(self._build_card(employee), row, col)
+        self._grid.setRowStretch(len(roster) // self._CARDS_PER_ROW + 1, 1)
+
+    def _build_card(self, employee: dict) -> QFrame:
+        card = QFrame()
+        card.setObjectName("Panel")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 18, 18, 16)
+        layout.setSpacing(10)
+
+        avatar = QLabel()
+        avatar.setPixmap(_circular_avatar_pixmap(employee["photo"], 64))
+        avatar.setFixedSize(64, 64)
+        layout.addWidget(avatar, alignment=Qt.AlignHCenter)
+
+        name_label = QLabel(employee["name"])
+        name_label.setObjectName("SectionTitle")
+        name_label.setAlignment(Qt.AlignCenter)
+        name_label.setWordWrap(True)
+        layout.addWidget(name_label)
+
+        button_row = QHBoxLayout()
+        edit_button = QPushButton("Editar")
+        edit_button.setObjectName("SecondaryButton")
+        edit_button.setCursor(Qt.PointingHandCursor)
+        edit_button.clicked.connect(lambda checked=False, e=employee: self._on_edit_clicked(e))
+        delete_button = QPushButton("Eliminar")
+        delete_button.setObjectName("DangerButton")
+        delete_button.setCursor(Qt.PointingHandCursor)
+        delete_button.clicked.connect(lambda checked=False, e=employee: self._on_delete_clicked(e))
+        button_row.addWidget(edit_button)
+        button_row.addWidget(delete_button)
+        layout.addLayout(button_row)
+
+        return card
+
+    def _on_add_clicked(self) -> None:
+        dialog = _EmployeeEditDialog(existing=None, parent=self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        name = dialog.result_name
+        roster = load_employees_roster()
+        if any(e["name"].strip().lower() == name.lower() for e in roster):
+            QMessageBox.warning(self, "Ya existe", f"Ya hay un empleado llamado «{name}».")
+            return
+        try:
+            photo_filename = _save_employee_photo(dialog.picked_photo_path, name)
+        except ValueError as exc:
+            QMessageBox.critical(self, "No se pudo guardar la foto", str(exc))
+            return
+        roster.append({
+            "name": name,
+            "match_name": name.split()[0] if name.split() else name,
+            "photo": photo_filename,
+        })
+        save_employees_roster(roster)
+        self.refresh()
+
+    def _on_edit_clicked(self, employee: dict) -> None:
+        dialog = _EmployeeEditDialog(existing=employee, parent=self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        new_name = dialog.result_name
+        roster = load_employees_roster()
+        target = next((e for e in roster if e["photo"] == employee["photo"]), None)
+        if target is None:
+            # The roster changed elsewhere between this card being drawn
+            # and the dialog being saved — shouldn't normally happen in
+            # a single-user desktop app, but refresh and let the user
+            # retry rather than silently doing nothing.
+            self.refresh()
+            return
+        if any(
+            e is not target and e["name"].strip().lower() == new_name.lower()
+            for e in roster
+        ):
+            QMessageBox.warning(self, "Ya existe", f"Ya hay un empleado llamado «{new_name}».")
+            return
+        if dialog.picked_photo_path:
+            try:
+                _save_employee_photo(dialog.picked_photo_path, new_name, existing_photo=target["photo"])
+            except ValueError as exc:
+                QMessageBox.critical(self, "No se pudo guardar la foto", str(exc))
+                return
+        target["name"] = new_name
+        save_employees_roster(roster)
+        self.refresh()
+
+    def _on_delete_clicked(self, employee: dict) -> None:
+        answer = QMessageBox.question(
+            self,
+            "Eliminar empleado",
+            f"¿Eliminar a «{employee['name']}» de la lista de empleados?\n\n"
+            "Ya no aparecerá para marcar en nuevos proyectos, pero los "
+            "proyectos que ya lo tienen marcado conservan ese texto en "
+            "el Excel — no se borra nada del histórico.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        roster = [e for e in load_employees_roster() if e["photo"] != employee["photo"]]
+        save_employees_roster(roster)
+        self.refresh()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -2388,6 +3212,7 @@ class MainWindow(QMainWindow):
         self.resize(1360, 840)
         self.setMinimumSize(1080, 680)
         self.refresh_worker: RefreshWorker | None = None
+        self.sync_trabajos_worker: SyncTrabajosWorker | None = None
 
         root = QWidget()
         root.setObjectName("AppRoot")
@@ -2412,6 +3237,12 @@ class MainWindow(QMainWindow):
         self.proyectos_info_detail_page = ProyectosInfoDetailPage()
         self.proyectos_info_new_page = ProyectosInfoNewPage()
         self.proyectos_info_company_page = ProyectosInfoCompanyPage()
+        # Added at the end of the stack (index 8) rather than renumbering
+        # every existing sub-page index above — its sidebar POSITION
+        # (right below Ofertas) is set independently by where its entry
+        # sits in the `buttons` list in _build_sidebar(), not by its
+        # stack index.
+        self.configuracion_page = ConfiguracionPage()
         for page in (
             self.projects_page,
             self.proyectos_info_page,
@@ -2421,6 +3252,7 @@ class MainWindow(QMainWindow):
             self.proyectos_info_detail_page,
             self.proyectos_info_new_page,
             self.proyectos_info_company_page,
+            self.configuracion_page,
         ):
             self.stack.addWidget(page)
         main.addWidget(self.stack, 1)
@@ -2453,6 +3285,7 @@ class MainWindow(QMainWindow):
         self.proyectos_info_company_page.project_info_opened.connect(self.open_project_info)
         self.proyectos_info_detail_page.back_button.clicked.connect(self._go_back)
         self.proyectos_info_page.new_project_requested.connect(self.open_new_project)
+        self.proyectos_info_page.sync_trabajos_requested.connect(self.run_sync_trabajos)
         self.proyectos_info_new_page.back_button.clicked.connect(self._go_back)
         # Buscar's "Proyectos Info" button on a folder result — reuses
         # open_project_info, so "Volver" on the detail page correctly
@@ -2464,7 +3297,44 @@ class MainWindow(QMainWindow):
         self.proyectos_info_new_page.project_created.connect(self.open_new_project_result)
 
         self._navigate(0)
+        self._apply_index_role_ui()
         self.refresh_all()
+
+    def _apply_index_role_ui(self) -> None:
+        """Only relevant in shared index mode (see config.example.yaml's
+        "SHARED INDEX MODE" section) — everywhere else data_service.
+        is_index_builder() is always True (every PC "builds" its own
+        local copy) and this is a no-op. On a PC that's configured as a
+        reader (shared_db_path set, is_index_builder false/unset), the
+        Actualizar button would otherwise just produce a "no puede
+        actualizarlo" error every time it's clicked — greying it out
+        with an explanatory tooltip up front is clearer than letting
+        someone click into that."""
+        if data_service.is_index_builder():
+            return
+        self.refresh_button.setEnabled(False)
+        self.refresh_button.setText("↻  Solo lectura")
+        self.refresh_button.setToolTip(
+            "Este PC solo lee el índice compartido; no puede actualizarlo. "
+            "Pide a quien gestione el PC generador que ejecute la actualización allí."
+        )
+
+    def _shared_index_status_message(self) -> str | None:
+        """"Índice compartido actualizado el <fecha> por <host>", or None
+        when shared_db_path isn't configured (nothing to add to the
+        default "Listo"/"Datos actualizados" status messages) — used so
+        a reader PC has SOME way to see when the shared index was last
+        actually refreshed, since its own Actualizar button can't tell
+        it that by refreshing itself."""
+        info = data_service.shared_index_info()
+        if not info:
+            return None
+        built_at = info.get("built_at")
+        host = info.get("built_by_host") or "?"
+        if not built_at:
+            return None
+        when = datetime.datetime.fromtimestamp(built_at).strftime("%d/%m/%Y %H:%M")
+        return f"Índice compartido actualizado el {when} por {host}"
 
     def _build_sidebar(self) -> QFrame:
         sidebar = QFrame()
@@ -2485,11 +3355,17 @@ class MainWindow(QMainWindow):
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
         self.nav_buttons: list[QPushButton] = []
+        # Stack index (second element) is NOT the same as position in
+        # this list — Configuración lives at stack index 8 (added last,
+        # after every other page, so nothing else had to be renumbered)
+        # but its sidebar entry is placed right here, directly below
+        # Ofertas, per the explicit request.
         buttons = [
             ("▦  Proyectos", 0),
             ("ℹ️  Proyectos Info", 1),
             ("🔍  Buscar", 2),
             ("📄  Ofertas", 3),
+            ("⚙️  Configuración", 8),
         ]
         for text, index in buttons:
             button = QPushButton(text)
@@ -2544,15 +3420,23 @@ class MainWindow(QMainWindow):
         5: ("Proyecto Info", ""),
         6: ("Nuevo proyecto", "Añade una fila nueva a uno de los archivos por año"),
         7: ("Proyectos de la empresa", ""),
+        8: ("Configuración", "Añade, edita o elimina empleados de la lista de empleados"),
     }
+
+    # Top-level pages — each has its own always-visible sidebar button
+    # (see _build_sidebar's `buttons` list) and gets highlighted while
+    # active. Every other stack index is a sub-page reached by drilling
+    # in from one of these (see _open_subpage), with no sidebar entry
+    # of its own.
+    _TOP_LEVEL_PAGE_INDEXES = (0, 1, 2, 3, 8)
 
     def _navigate(self, index: int) -> None:
         self.stack.setCurrentIndex(index)
         title, subtitle = self._PAGE_TITLES[index]
         self.top_title.setText(title)
         self.top_subtitle.setText(subtitle)
-        if index in (0, 1, 2, 3):
-            for button, button_index in zip(self.nav_buttons, (0, 1, 2, 3)):
+        if index in self._TOP_LEVEL_PAGE_INDEXES:
+            for button, button_index in zip(self.nav_buttons, self._TOP_LEVEL_PAGE_INDEXES):
                 button.setChecked(button_index == index)
         else:
             # Sub-pages (Proyecto, Proyecto Info, Nuevo proyecto, the
@@ -2573,6 +3457,12 @@ class MainWindow(QMainWindow):
             self.proyectos_info_page.refresh()
         elif index == 3:
             self.ofertas_page.refresh()
+        elif index == 8:
+            # Re-read roster.json fresh every visit (not just once at
+            # startup) — picks up edits made in THIS same session
+            # without needing anything fancier, since ConfiguracionPage
+            # itself is also the only place those edits can come from.
+            self.configuracion_page.refresh()
 
     def _open_subpage(self, index: int) -> None:
         """Navigate to a page reached by drilling into something
@@ -2627,7 +3517,13 @@ class MainWindow(QMainWindow):
             self.proyectos_info_page.refresh()
             self.search_page.refresh()
             self.ofertas_page.refresh()
-            self.statusBar().showMessage("Datos actualizados", 4000)
+            # In shared index mode (see config.example.yaml), this is the
+            # one place a reader PC finds out when the shared index was
+            # actually last built — its own Actualizar button is
+            # disabled/read-only (see _apply_index_role_ui) so it can't
+            # tell them that by refreshing itself.
+            shared_message = self._shared_index_status_message()
+            self.statusBar().showMessage(shared_message or "Datos actualizados", 6000 if shared_message else 4000)
         except Exception as exc:
             self.statusBar().showMessage("No se pudieron cargar los datos", 4000)
             QMessageBox.critical(self, "Error al cargar datos", str(exc))
@@ -2659,6 +3555,71 @@ class MainWindow(QMainWindow):
         label = STAGE_LABELS.get(stage, stage)
         self.projects_page.set_processing(True, label)
         self.statusBar().showMessage(label)
+
+    def run_sync_trabajos(self) -> None:
+        if self.sync_trabajos_worker and self.sync_trabajos_worker.isRunning():
+            return
+        year = datetime.date.today().year
+        answer = QMessageBox.question(
+            self,
+            "Sincronizar carpetas nuevas",
+            f"Se recorrerá TRABAJOS {year} en P: buscando carpetas de proyecto/ubicación\n"
+            f"que todavía no tengan una fila en {year}.xlsx, y se añadirá una fila nueva\n"
+            "(NOMBRE + NUMERO DE PROYECTO) por cada una que falte. Las filas ya existentes\n"
+            "no se tocan.\n\n¿Continuar?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        self.proyectos_info_page.sync_trabajos_button.setEnabled(False)
+        self.proyectos_info_page.sync_trabajos_button.setText("⟳  Sincronizando...")
+        self.statusBar().showMessage(f"Buscando carpetas nuevas en TRABAJOS {year}...")
+
+        self.sync_trabajos_worker = SyncTrabajosWorker(self)
+        self.sync_trabajos_worker.finished_with_result.connect(self._sync_trabajos_finished)
+        self.sync_trabajos_worker.start()
+
+    def _sync_trabajos_finished(self, success: bool, message: str, result: dict) -> None:
+        self.proyectos_info_page.sync_trabajos_button.setEnabled(True)
+        self.proyectos_info_page.sync_trabajos_button.setText("⟳  Sincronizar carpetas nuevas")
+        if not success:
+            self.statusBar().showMessage("La sincronización terminó con errores", 5000)
+            QMessageBox.critical(self, "Error al sincronizar carpetas", message)
+            return
+
+        added = result.get("added") or []
+        if not result.get("trabajos_dir"):
+            self.statusBar().showMessage("Sincronización terminada", 4000)
+            QMessageBox.warning(
+                self,
+                "Carpeta TRABAJOS no configurada",
+                "No se encontró la carpeta 'trabajos' en la configuración (roots en "
+                "config.yaml) — no se ha comprobado nada.",
+            )
+            return
+
+        self.statusBar().showMessage(
+            f"Sincronización completada: {len(added)} fila(s) nueva(s)", 6000
+        )
+        if added:
+            lines = "\n".join(f"  • {row['nombre']}  ({row['numero_de_proyecto']})" for row in added)
+            QMessageBox.information(
+                self,
+                "Sincronización completada",
+                f"Carpetas revisadas: {result.get('checked')}\n"
+                f"Ya existían: {result.get('already_present')}\n"
+                f"Filas nuevas añadidas ({len(added)}):\n{lines}",
+            )
+            self.proyectos_info_page.refresh()
+        else:
+            QMessageBox.information(
+                self,
+                "Sincronización completada",
+                f"Carpetas revisadas: {result.get('checked')}\n"
+                "No se encontró ninguna carpeta nueva — el Excel ya estaba al día.",
+            )
 
     def _refresh_finished(self, success: bool, message: str, stats: dict) -> None:
         self.refresh_button.setEnabled(True)

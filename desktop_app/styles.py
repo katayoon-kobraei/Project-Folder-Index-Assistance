@@ -131,6 +131,19 @@ QPushButton#LinkButton {
 }
 QPushButton#LinkButton:hover { color: #094836; text-decoration: underline; }
 
+QPushButton#DangerButton {
+    background: white;
+    color: #b3261e;
+    border: 1px solid #f3c6c2;
+    border-radius: 9px;
+    padding: 9px 14px;
+    font-weight: 650;
+}
+QPushButton#DangerButton:hover {
+    background: #fdecea;
+    border-color: #e1897f;
+}
+
 /* Panels */
 QFrame#Panel {
     background: white;

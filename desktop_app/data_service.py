@@ -11,9 +11,11 @@ against the same database without any extra setup.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 BASE_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(BASE_DIR))
@@ -36,6 +38,9 @@ from src.search.search import (  # noqa: E402
 )
 from src.project_info.reader import YEARS_WITH_DATA, load_project_info  # noqa: E402
 from src.project_info import writer as project_info_writer  # noqa: E402
+from src.project_info.sync_trabajos import (  # noqa: E402
+    sync_new_projects_from_trabajos as _sync_new_projects_from_trabajos,
+)
 from src.webapp import pipeline  # noqa: E402
 
 CONFIG_PATH = BASE_DIR / "config" / "config.yaml"
@@ -52,9 +57,72 @@ def load_config() -> dict:
     return yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 
 
+def _resolve_path(path: str) -> str:
+    return path if Path(path).is_absolute() else str(BASE_DIR / path)
+
+
+def _shared_db_path() -> str | None:
+    """The shared-index path from config.yaml (see config.example.yaml's
+    "SHARED INDEX MODE" section), resolved to an absolute path — or None
+    when it's unset, which is the default fully-local-per-PC behavior."""
+    shared = load_config().get("shared_db_path")
+    return _resolve_path(shared) if shared else None
+
+
 def _db_path() -> str:
-    db_path = load_config()["db_path"]
-    return db_path if Path(db_path).is_absolute() else str(BASE_DIR / db_path)
+    """The sqlite file THIS process actually queries. Once shared_db_path
+    is configured, every PC (including the one PC that's the builder)
+    queries that shared file — db_path is then only ever used as the
+    builder's own private local staging file during a crawl (see
+    src/webapp/pipeline.py), never queried directly, so a builder PC's own
+    screens always show exactly what every other PC sees too."""
+    shared = _shared_db_path()
+    if shared:
+        return shared
+    return _resolve_path(load_config()["db_path"])
+
+
+def _as_bool(value) -> bool:
+    """See src/webapp/pipeline.py's identical helper for why this exists
+    instead of a plain bool(value) — config.yaml's is_index_builder is
+    meant to be a real YAML boolean, but this tolerates it being a
+    hand-typed or installer-written quoted string too, since bool("false")
+    would otherwise be True."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "si", "sí", "on")
+    return bool(value)
+
+
+def is_index_builder() -> bool:
+    """Whether THIS PC is allowed to actually crawl and publish the
+    shared index — always True when shared_db_path isn't configured at
+    all (the fully-local default, where every PC "builds" its own copy)."""
+    config = load_config()
+    if not config.get("shared_db_path"):
+        return True
+    return _as_bool(config.get("is_index_builder", False))
+
+
+def shared_index_info() -> dict | None:
+    """{"built_at": <unix ts>, "built_by_host": <str>} from the shared
+    index's own .meta.json sidecar (written by pipeline._publish_db each
+    time the builder PC publishes) — or None when shared_db_path isn't
+    configured, or the sidecar doesn't exist yet (nothing published so
+    far). Used by the UI to show readers when the shared index was last
+    actually updated, since their own "Actualizar" button can't tell them
+    that by refreshing it themselves."""
+    shared = _shared_db_path()
+    if not shared:
+        return None
+    meta_path = Path(shared + ".meta.json")
+    if not meta_path.exists():
+        return None
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
 
 
 _schema_ensured = False
@@ -69,9 +137,28 @@ def _ensure_schema() -> None:
     statement in schema.sql is an idempotent CREATE ... IF NOT EXISTS,
     but re-parsing and re-checking all of them still costs a few tens of
     ms — negligible once at startup, but that adds up fast repeated on
-    every single search keystroke."""
+    every single search keystroke.
+
+    In shared index mode this deliberately does NOT call open_db() at
+    all — open_db() creates the file (and sets it up with WAL, a mode
+    that isn't reliable over a network share) if it doesn't already
+    exist, which would be actively harmful here: a reader PC opening the
+    app before the builder has ever published anything would otherwise
+    silently create/initialize an empty database AT the shared path
+    itself. Readers only ever get a clear error telling them nothing's
+    been published yet."""
     global _schema_ensured
     if _schema_ensured:
+        return
+    shared = _shared_db_path()
+    if shared:
+        if not Path(shared).exists():
+            raise RuntimeError(
+                "El indice compartido todavia no existe en "
+                f"{shared}. Pide a quien gestione el PC generador que pulse "
+                "'Actualizar' alli al menos una vez."
+            )
+        _schema_ensured = True
         return
     open_db(_db_path()).close()
     _schema_ensured = True
@@ -79,6 +166,30 @@ def _ensure_schema() -> None:
 
 def get_connection() -> sqlite3.Connection:
     _ensure_schema()
+    shared = _shared_db_path()
+    if shared:
+        # Read-only, immutable URI connection — a reader PC must never be
+        # able to write to, lock, or (per _ensure_schema above) create
+        # the shared file. immutable=1 additionally tells SQLite this
+        # exact file will not change for as long as this connection stays
+        # open (true here: pipeline._publish_db always writes a brand new
+        # file via os.replace() rather than mutating this one in place),
+        # so SQLite skips the locking/change-detection it would otherwise
+        # still do even for a plain read-only open.
+        #
+        # That locking machinery matters here because pipeline.py also
+        # deliberately publishes in plain rollback-journal mode, not WAL:
+        # a WAL-mode database's read-only opens still need to create/
+        # access its -shm shared-memory sidecar for coordination, which a
+        # reader that only has read access to the shared folder may not
+        # be able to do at all — non-WAL avoids that requirement
+        # entirely, and immutable=1 here is belt-and-suspenders on top of
+        # that. quote(..., safe="/:") percent-encodes anything that would
+        # otherwise be ambiguous in a file: URI (spaces, #, ?, ...) while
+        # leaving the path separators and the drive-letter colon (e.g.
+        # "P:") untouched.
+        uri = "file:" + quote(Path(shared).as_posix(), safe="/:") + "?mode=ro&immutable=1"
+        return sqlite3.connect(uri, uri=True)
     return sqlite3.connect(_db_path())
 
 
@@ -268,6 +379,22 @@ def create_project_info(year: int, values: dict) -> dict:
     # at the very bottom of the sheet.
     year_rows = [r for r in rows if r["year"] == year]
     return year_rows[-1]
+
+
+def sync_new_projects_from_trabajos(year: int | None = None) -> dict:
+    """Runs src/project_info/sync_trabajos.py's scan against config.yaml's
+    "trabajos" root and project_info_dir, appending any missing job/site
+    combination to the given year's (defaults to the current calendar
+    year) NOMBRE column. See that module's docstring for the exact
+    matching rules. Backs the Proyectos Info page's second refresh
+    button — distinct from start_refresh()/refresh_status() above, which
+    rebuild the crawled P: index instead; this only ever appends rows to
+    the hand-maintained project_info xlsx files.
+
+    Raises FileNotFoundError if project_info_dir isn't configured, or
+    that year's xlsx file doesn't exist yet."""
+    result = _sync_new_projects_from_trabajos(load_config(), _project_info_dir(), year=year)
+    return result
 
 
 def all_projects(name_query: str = "", year: int | None = None) -> list[dict]:

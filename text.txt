@@ -1,0 +1,8 @@
+pool request reset 
+no atachment + no save in the folder 
+Do --> without attachment but save them first 'dehu' in the sender name or subject name 
+date_sender domain_organismo emisor:
+notifocation
+
+MVERA_subject 
+remove DESCONOCIDO
