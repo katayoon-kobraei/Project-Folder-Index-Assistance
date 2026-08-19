@@ -31,20 +31,28 @@ they appear in the sheet.
 
 Four columns are constrained to a fixed set of categories in the
 original master workbook (its "TIPOS" sheet) — CATEGORY_OPTIONS below
-holds the exact confirmed lists, used to render these as single-choice
-pickers (radio buttons) instead of free text in the edit form:
+holds the exact confirmed lists. PLANNING is single-choice (radio
+buttons in the edit form — a project only has one status at a time);
+the other three allow picking more than one at once (checkboxes — see
+CATEGORY_MULTI_FIELDS below and main_window.py's categories_panel),
+saved as a comma-separated cell, same convention as LISTADO DE
+EMPLEADOS:
     PLANNING (-> status)     Inicio Proyecto / Proceso / Acabado /
-                              Cancelado / DO — "Inicio Proyecto" is an
-                              app-only addition, not one of the values
-                              confirmed from the master workbook's TIPOS
-                              sheet; selecting it also stamps FECHA DEL
-                              PROYECTO with that moment's date (see
-                              main_window.py's _on_category_toggled).
+                              Cancelado / DO / Versión anterior —
+                              "Inicio Proyecto" is an app-only addition,
+                              not one of the values confirmed from the
+                              master workbook's TIPOS sheet; selecting
+                              it also stamps FECHA DEL PROYECTO with
+                              that moment's date (see main_window.py's
+                              _on_category_toggled). "Versión anterior"
+                              is likewise an app-only addition.
     TIPO (-> work_type)      ESTUDIO / CONSULTORÍA / PROYECTO / DO + CSS
+                              — multiple allowed
     SUBTIPO1 (-> subtipo1)   Estación de servicio / Establecimiento /
-                              Industrial / Urbanización
+                              Industrial / Urbanización — multiple
+                              allowed
     SUBTIPO2 (-> subtipo2)   Certificado / Habilitación / Accesos /
-                              Instalaciones / DIC
+                              Instalaciones / DIC — multiple allowed
 
 Two pairs of raw columns are additionally exposed as combined,
 read-only display fields for convenience (NOT written back to directly
@@ -99,6 +107,11 @@ FIELD_MAP = [
     ("SUBTIPO2", "subtipo2", False),
     ("COMIENZO DE LA OBRA", "work_start_date", True),
     ("FIN DE LA OBRA", "deadline", True),
+    # The project's own completion date — distinct from FIN DE LA OBRA
+    # above (that one's specifically when the construction WORK itself
+    # finishes, not the project as a whole). A new column, auto-created
+    # on first write via writer._ensure_column, same as flag/subprojects.
+    ("FECHA FIN DEL PROYECTO", "end_date", True),
     # Older/fuller-schema columns — kept for backwards compatibility
     # with files that still have them.
     ("PRESUPUESTO EN Nº\nEJECUCIÓN MATERIAL", "budget_execution", False),
@@ -124,6 +137,15 @@ FIELD_MAP = [
     ("CERT REPR BI", "cert_repr_bi", False),
     ("CERT REPR IVA", "cert_repr_iva", False),
     ("CERT REPR TOTALES", "cert_repr_totales", False),
+    # Added for the "Sincronizar carpetas nuevas" subproject detection
+    # (see src/project_info/sync_trabajos.py): when a job/site folder's
+    # own "no further subdivision" folder (00.-PLANOS) has OTHER sibling
+    # folders alongside it that don't start with a number, each becomes
+    # its own row with "subprojects" set to that folder's name, and
+    # "flag" set to TRUE on the parent job/site row so it's easy to spot
+    # which projects have subprojects at a glance.
+    ("flag", "flag", False),
+    ("subprojects", "subprojects", False),
 ]
 
 # key -> header, and key -> is_date, derived from FIELD_MAP so writer.py
@@ -135,11 +157,17 @@ _KEY_IS_DATE = {key: is_date for _header, key, is_date in FIELD_MAP}
 # used to render these four fields as radio-button pickers in the edit
 # form rather than free text.
 CATEGORY_OPTIONS = {
-    "status": ["Inicio Proyecto", "Proceso", "Acabado", "Cancelado", "DO"],
+    "status": ["Inicio Proyecto", "Proceso", "Acabado", "Cancelado", "DO", "Versión anterior"],
     "work_type": ["ESTUDIO", "CONSULTORÍA", "PROYECTO", "DO + CSS"],
     "subtipo1": ["Estación de servicio", "Establecimiento", "Industrial", "Urbanización"],
     "subtipo2": ["Certificado", "Habilitación", "Accesos", "Instalaciones", "DIC"],
 }
+
+# Which of the CATEGORY_OPTIONS keys allow picking more than one value at
+# once (checkboxes in the UI) rather than exactly one (radio buttons).
+# "status"/PLANNING is deliberately NOT in here — a project only has one
+# status at a time.
+CATEGORY_MULTI_FIELDS = frozenset({"work_type", "subtipo1", "subtipo2"})
 
 
 def _format_date(value) -> str | None:

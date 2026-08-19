@@ -10,6 +10,7 @@ is decided.
 import sqlite3
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -38,13 +39,40 @@ def _load_config() -> dict:
     return yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
 
+def _resolve_path(path: str) -> str:
+    return path if Path(path).is_absolute() else str(BASE_DIR / path)
+
+
 def _db_path() -> str:
-    return _load_config()["db_path"]
+    # See desktop_app/data_service.py's identical shared_db_path handling
+    # for the full reasoning — kept in sync manually since this Flask app
+    # is a separate process/entry point from the desktop app, not shared
+    # code, even though both read the same config.yaml.
+    config = _load_config()
+    shared = config.get("shared_db_path")
+    if shared:
+        return _resolve_path(shared)
+    return _resolve_path(config["db_path"])
 
 
 def get_db():
-    db_path = _db_path()
-    full_path = db_path if Path(db_path).is_absolute() else str(BASE_DIR / db_path)
+    full_path = _db_path()
+    shared = _load_config().get("shared_db_path")
+    if shared:
+        if not Path(full_path).exists():
+            raise RuntimeError(
+                "El indice compartido todavia no existe en "
+                f"{full_path}. Pide a quien gestione el PC generador que "
+                "pulse 'Actualizar' alli al menos una vez."
+            )
+        # mode=ro&immutable=1 — see desktop_app/data_service.py's
+        # get_connection() for the full reasoning (short version: the
+        # published file is always in plain rollback-journal mode, never
+        # WAL, specifically so a read-only open like this one never needs
+        # write access to a -shm sidecar; immutable=1 is belt-and-
+        # suspenders on top of that).
+        uri = "file:" + quote(Path(full_path).as_posix(), safe="/:") + "?mode=ro&immutable=1"
+        return sqlite3.connect(uri, uri=True)
     return sqlite3.connect(full_path)
 
 
@@ -116,7 +144,13 @@ def api_refresh():
     config = _load_config()
     started = pipeline.start_refresh(config)
     if not started:
-        return jsonify({"status": "already_running"}), 409
+        # start_refresh always sets a specific reason in this case — a
+        # real "already running" locally, or (shared index mode) this PC
+        # isn't the builder, or another PC currently holds the shared-
+        # index lock — not just the one generic "already_running" outcome
+        # this endpoint used to always report.
+        reason = pipeline.get_status().get("error") or "already_running"
+        return jsonify({"status": "already_running", "reason": reason}), 409
     return jsonify({"status": "started"})
 
 

@@ -2,14 +2,16 @@
 Entry point: `python scripts/split_project_info_by_year.py <source.xlsx> <output_dir>`
 
 One-time (re-runnable) conversion: reads the master "LISTADO PROYECTOS
-POR AÑOS" workbook — one sheet per year — and writes a separate,
-single-sheet workbook per year (2024.xlsx / 2025.xlsx / 2026.xlsx, only
-for years that actually have a sheet in the source) into <output_dir>.
-This is what the Proyectos Info page actually reads from — see
-project_info_dir in config/config.yaml — not the master file directly.
+POR AÑOS" workbook — one sheet per year, 2008-2026 (see
+src/project_info/reader.py's YEARS_WITH_DATA) — and writes a separate,
+single-sheet workbook per year (2008.xlsx through 2026.xlsx, only for
+years that actually have a sheet — or, for 2012/2013, a combined sheet —
+in the source) into <output_dir>. This is what the Proyectos Info page
+actually reads from — see project_info_dir in config/config.yaml — not
+the master file directly.
 
 Re-run this any time the master workbook is updated; it always
-overwrites the same 3 files, so config/config.yaml's project_info_dir
+overwrites the same files, so config/config.yaml's project_info_dir
 never needs to change.
 """
 
@@ -30,7 +32,7 @@ def main():
     written = split_workbook_by_year(source_path, output_dir)
 
     if not written:
-        print("No se encontró ningún año (2024/2025/2026) en el archivo origen.")
+        print("No se encontró ningún año (2008-2026) en el archivo origen.")
         sys.exit(1)
 
     print(f"Escritos {len(written)} archivo(s) en {output_dir}:")

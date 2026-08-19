@@ -358,6 +358,42 @@ def find_project_info_by_job_code(job_code: str, preferred_year: int | None = No
     return matches
 
 
+def pick_project_info_match(matches: list[dict], folder_name: str | None) -> dict | None:
+    """When find_project_info_by_job_code() returns several rows sharing
+    the exact same NUMERO DE PROYECTO — routine now that a job/site
+    folder with subprojects gets one base row PLUS one extra row per
+    subproject folder, all carrying that SAME code (see
+    src/project_info/sync_trabajos.py) — pick the ONE row that actually
+    corresponds to `folder_name` (the folder just clicked in Buscar),
+    instead of blindly opening whichever happens to be first:
+      - if folder_name exactly matches one row's "subprojects" value
+        (see reader.py's FIELD_MAP — the subproject folder's own name,
+        e.g. "MEMORIA URBANIZACION V_2026-04-16"), that row is it;
+      - otherwise, if folder_name doesn't match ANY row's subprojects
+        value, the folder being looked up must be the site/job folder
+        itself (not one of ITS subproject folders) — the base
+        combination row, the one with no subprojects value at all, is
+        the right one, provided there's exactly one such row.
+    Returns None (caller falls back to opening the first match and
+    warning there were others) when neither rule narrows it down to
+    exactly one row — e.g. folder_name is missing, or the data is
+    ambiguous in some other way this doesn't anticipate."""
+    if not folder_name:
+        return None
+    normalized = folder_name.strip().casefold()
+    subproject_matches = [
+        m for m in matches
+        if (m.get("subprojects") or "").strip().casefold() == normalized
+    ]
+    if len(subproject_matches) == 1:
+        return subproject_matches[0]
+    if not subproject_matches:
+        base_matches = [m for m in matches if not (m.get("subprojects") or "").strip()]
+        if len(base_matches) == 1:
+            return base_matches[0]
+    return None
+
+
 def update_project_info(item_id: int, updates: dict) -> dict:
     """Save edits from the Editar form for one project_info row straight
     into its source cell (see src/project_info/writer.py — only that one
@@ -377,6 +413,26 @@ def update_project_info(item_id: int, updates: dict) -> dict:
         _project_info_dir(), row["year"], row["row_number"], updates
     )
     return project_info_detail(item_id)
+
+
+def delete_project_info(item_id: int) -> None:
+    """Permanently delete one project_info row from its source xlsx (see
+    src/project_info/writer.py's delete_project_info_row — an actual row
+    removal, not just clearing cells). Backs the delete button on the
+    company projects page (ProyectosInfoCompanyPage) — select a row
+    there, delete it, and it's gone from both the UI and the Excel file.
+
+    Raises FileNotFoundError if item_id no longer matches any row (e.g.
+    the underlying file already changed since the page was opened) or
+    the year's file is missing. No return value: the caller re-reads via
+    project_info_rows()/refresh() afterwards, same mtime-based cache
+    invalidation as update_project_info()/create_project_info()."""
+    row = project_info_detail(item_id)
+    if row is None:
+        raise FileNotFoundError("Este proyecto ya no está en el archivo de datos.")
+    project_info_writer.delete_project_info_row(
+        _project_info_dir(), row["year"], row["row_number"]
+    )
 
 
 def create_project_info(year: int, values: dict) -> dict:

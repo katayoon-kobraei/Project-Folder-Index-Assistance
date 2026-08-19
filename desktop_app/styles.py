@@ -143,6 +143,11 @@ QPushButton#DangerButton:hover {
     background: #fdecea;
     border-color: #e1897f;
 }
+QPushButton#DangerButton:disabled {
+    background: #fafafa;
+    color: #c9a8a5;
+    border-color: #f0dedc;
+}
 
 /* Panels */
 QFrame#Panel {
@@ -390,6 +395,20 @@ QTreeWidget::item {
     border: none;
 }
 QTreeWidget::item:hover { background: #f0f9f6; }
+/* Once ANY QTreeWidget::item rule exists (padding/hover above), Qt stops
+   painting selection from the selection-background-color/selection-color
+   properties set on QTreeWidget itself and relies entirely on an
+   explicit ::item:selected rule instead — without this, clicking a row
+   selects it (selectedItems()/isSelected() still work fine) but nothing
+   visibly changes, exactly the "no color change" symptom reported for
+   the delete-a-row flow on the company projects page. Same teal tone as
+   the (now effectively unused, but left in place as a fallback) top-level
+   selection-background-color above. */
+QTreeWidget::item:selected {
+    background: #d7f0e6;
+    color: #102a43;
+}
+QTreeWidget::item:selected:hover { background: #c7e9db; }
 QTreeWidget::branch { background: white; }
 
 /* Progress and scrollbars */

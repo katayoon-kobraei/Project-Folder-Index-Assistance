@@ -70,7 +70,11 @@ except ImportError:  # pragma: no cover - depends on the machine's PySide6 build
     _HAS_WEBENGINE = False
 
 from desktop_app import data_service
-from src.project_info.reader import CATEGORY_OPTIONS, YEARS_WITH_DATA  # noqa: E402
+from src.project_info.reader import (  # noqa: E402
+    CATEGORY_MULTI_FIELDS,
+    CATEGORY_OPTIONS,
+    YEARS_WITH_DATA,
+)
 
 STAGE_LABELS = {
     "crawling": "Recorriendo carpetas...",
@@ -345,7 +349,11 @@ class SearchPage(QWidget):
     row(s) there (see data_service.find_project_info_by_job_code) and
     opens that project's detail card directly — the same page with the
     category radio pickers — without having to go hunt for it by
-    company name on the Proyectos Info page."""
+    company name on the Proyectos Info page. When several rows share
+    that exact code (a job/site with subprojects — see
+    sync_trabajos.py), data_service.pick_project_info_match narrows to
+    the one row that actually matches the clicked folder's own name,
+    rather than always opening whichever happens to be first."""
 
     project_info_requested = Signal(int)
 
@@ -629,14 +637,28 @@ class SearchPage(QWidget):
                 f'No se encontró ningún proyecto con el código "{code}" en Proyectos Info.',
             )
             return
-        if len(matches) > 1:
-            QMessageBox.information(
-                self,
-                "Varias coincidencias",
-                f'{len(matches)} filas de Proyectos Info coinciden con el código "{code}". '
-                "Se abre la primera — usa el botón Volver y la página Proyectos Info "
-                "para ver las demás.",
-            )
+        if len(matches) == 1:
+            self.project_info_requested.emit(matches[0]["id"])
+            return
+
+        # Several rows share this exact code — normal now that a job/site
+        # with subprojects has a base row plus one row per subproject
+        # folder (see sync_trabajos.py). Narrow to the one that actually
+        # matches THIS folder (see data_service.pick_project_info_match)
+        # before ever falling back to "open the first one and warn there
+        # were others".
+        best = data_service.pick_project_info_match(matches, folder.get("name"))
+        if best is not None:
+            self.project_info_requested.emit(best["id"])
+            return
+
+        QMessageBox.information(
+            self,
+            "Varias coincidencias",
+            f'{len(matches)} filas de Proyectos Info coinciden con el código "{code}". '
+            "Se abre la primera — usa el botón Volver y la página Proyectos Info "
+            "para ver las demás.",
+        )
         self.project_info_requested.emit(matches[0]["id"])
 
 
@@ -818,13 +840,19 @@ PROJECT_INFO_FIELDS = [
     # below), which show them individually rather than pre-joined and
     # let you change them directly, so repeating them as plain text here
     # too would just be a stale-looking duplicate.
+    #
+    # "Trabajos a realizar"/work_description is likewise deliberately NOT
+    # listed here — it now has its own always-visible "Comentario" box
+    # (see comment_panel), which would otherwise show the exact same
+    # value twice on the same page (once as a plain label here, once in
+    # the editable box right below).
     ("Cliente", "client"),
     ("Ubicación", "location"),
     ("Año", "year"),
     ("Comienzo de la obra", "work_start_date"),
     ("Fecha límite (fin de la obra)", "deadline"),
+    ("Fecha fin del proyecto", "end_date"),
     ("Número de proyecto", "project_number"),
-    ("Trabajos a realizar", "work_description"),
     ("Título completo", "full_title"),
     ("Presupuesto (ejecución material)", "budget_execution"),
     ("Presupuesto de las obras", "budget_works"),
@@ -849,6 +877,13 @@ PROJECT_INFO_FIELDS = [
     ("Cert. repr. IVA", "cert_repr_iva"),
     ("Cert. repr. totales", "cert_repr_totales"),
     ("Notas", "notes"),
+    # Written by "Sincronizar carpetas nuevas" (see
+    # src/project_info/sync_trabajos.py) — a subproject row's own folder
+    # name, and TRUE on its parent job/site row when it has any. Blank
+    # on every ordinary row, same as everything else here, so this costs
+    # nothing on the vast majority of projects that don't use it.
+    ("Subproyecto", "subprojects"),
+    ("¿Tiene subproyectos?", "flag"),
 ]
 
 # "Lista de empleados" and "Fecha del proyecto" are NOT in
@@ -1157,14 +1192,33 @@ def _build_employee_checklist() -> tuple[QWidget, dict[str, QCheckBox]]:
     return container, checkboxes
 
 
-def _employee_list_text_from_checkboxes(checkboxes: dict[str, QCheckBox]) -> str | None:
-    """The comma-separated employee_list string to save, built from
-    whichever checkboxes are currently ticked — full names, e.g.
-    "Guillermo Gea Marco, Daniel", not just first names, so the saved
-    text is unambiguous even though _row_has_employee only needs the
-    short first-name form to re-recognize it later."""
+def _joined_text_from_checkboxes(checkboxes: dict[str, QCheckBox]) -> str | None:
+    """The comma-separated cell text to save, built from whichever
+    checkboxes are currently ticked (dict key -> its checkbox). Used for
+    two different multi-value fields that share the exact same "save
+    whatever's ticked, comma-joined" shape: employee_list (full names,
+    e.g. "Guillermo Gea Marco, Daniel" — see _row_has_employee for how
+    that's matched back later) AND the multi-choice category fields
+    TIPO/SUBTIPO1/SUBTIPO2 (see CATEGORY_MULTI_FIELDS/
+    _category_values_from_text, exact-token matched instead since those
+    options are a fixed list, not free text)."""
     ticked = [name for name in checkboxes if checkboxes[name].isChecked()]
     return ", ".join(ticked) or None
+
+
+def _category_values_from_text(value: str | None) -> set[str]:
+    """The set of options a multi-choice category cell (TIPO/SUBTIPO1/
+    SUBTIPO2 — see CATEGORY_MULTI_FIELDS) currently represents, parsed
+    from its comma-separated text (saved by _joined_text_from_checkboxes)
+    — used to tick the right checkboxes when a row loads. A token that
+    isn't one of that field's CATEGORY_OPTIONS any more (e.g. legacy
+    free text from before this was constrained to fixed categories) is
+    simply not represented by any checkbox — same lenient fallback as
+    the single-choice radios falling back to "(Sin especificar)" for an
+    unrecognized value."""
+    if not value:
+        return set()
+    return {part.strip() for part in value.split(",") if part.strip()}
 
 
 def _set_checkboxes_from_employee_list_text(
@@ -1193,6 +1247,7 @@ EDIT_TEXT_FIELDS = [
     ("Ciudad", "city"),
     ("Provincia", "province"),
     ("Fecha del proyecto (dd/mm/aaaa)", "start_date"),
+    ("Fecha fin del proyecto (dd/mm/aaaa)", "end_date"),
     ("Promotor", "client"),
 ]
 EDIT_MULTILINE_FIELDS = [
@@ -1222,6 +1277,11 @@ _PLANNING_PILL_STYLES = {
     "Proceso": "WarningPill",
     "DO": "NeutralPill",
     "Inicio Proyecto": "InfoPill",
+    # No dedicated pill color left for a 6th status — shares NeutralPill
+    # with "DO" (also the same style _planning_pill_style already falls
+    # back to for a status with no explicit entry here, so this line is
+    # just documentation-by-explicitness, not a behavior change).
+    "Versión anterior": "NeutralPill",
 }
 
 
@@ -1456,17 +1516,22 @@ class ProyectosInfoPage(QWidget):
         outer.addWidget(self.count_label)
 
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(3)
-        self.tree.setHeaderLabels(["Estado", "Proyecto", "Título"])
+        self.tree.setColumnCount(4)
+        # Column reads "Carpeta" per explicit request — the underlying
+        # value is still project_number (NUMERO DE PROYECTO), unrelated
+        # to Buscar's own "Carpeta" column (an actual folder name); the
+        # field's own label elsewhere (the card, the Editar form, the
+        # label above the title on the detail page) is still "Número de
+        # proyecto" — only this table header changed.
+        self.tree.setHeaderLabels(["Estado", "Carpeta", "Proyecto", "Título"])
         self.tree.setAlternatingRowColors(True)
         self.tree.setRootIsDecorated(True)
         # Estado first (small fixed width for its colored pill), then
-        # Proyecto and Título — both full NOMBRE/TITULO ENTERO DEL
-        # PROYECTO values, not truncated to the visible width, same idea
-        # as Ruta/Carpeta elsewhere in the app: let them grow to fit
-        # their full text (see resizeColumnToContents calls in _render)
-        # and rely on the tree's own horizontal scrollbar past the
-        # window edge.
+        # Número de proyecto/Proyecto/Título — all full values, not
+        # truncated to the visible width, same idea as Ruta/Carpeta
+        # elsewhere in the app: let them grow to fit their full text
+        # (see resizeColumnToContents calls in _render) and rely on the
+        # tree's own horizontal scrollbar past the window edge.
         self.tree.header().setStretchLastSection(False)
         # Wide enough for the longest status text ("Sin estado") plus
         # room for the branch/expand indentation of a matched ROW child
@@ -1476,6 +1541,20 @@ class ProyectosInfoPage(QWidget):
         # text against the column edge.
         self.tree.setColumnWidth(0, 130 + 2 * self.tree.indentation())
         self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+        # Double-click still ONLY navigates to ProyectosInfoCompanyPage
+        # (see _on_item_double_clicked) — without this, Qt's own default
+        # double-click-to-toggle-expand would also fire on the same
+        # click, which is redundant now that a single click already
+        # toggles it (see _on_item_single_clicked below) and would just
+        # be a visible flicker right before navigating away.
+        self.tree.setExpandsOnDoubleClick(False)
+        # A single click anywhere on a company row toggles it open/closed
+        # — not just clicking the small expand arrow itself (that still
+        # works too, natively, via Qt's own handling of clicks on the
+        # branch indicator specifically).
+        self.tree.itemClicked.connect(self._on_item_single_clicked)
+        self.tree.itemExpanded.connect(self._on_item_expanded)
+        self.tree.itemCollapsed.connect(self._on_item_collapsed)
         outer.addWidget(self.tree, 1)
 
         self._rows: list[dict] = []
@@ -1488,6 +1567,16 @@ class ProyectosInfoPage(QWidget):
         # row of every company on every keystroke regardless of whether
         # there's anything to actually undo.
         self._companies_with_revealed_rows: set[int] = set()
+        # id(company_item) for every company the user has manually
+        # expanded via the tree's own expand arrow (see _on_item_expanded
+        # / _on_item_collapsed) — kept separate from
+        # _companies_with_revealed_rows above (that one is purely a
+        # filter-match bookkeeping optimization) so _apply_filter can
+        # tell "revealed because it matched a search" apart from "the
+        # user explicitly asked to see everything here", and keep the
+        # latter expanded/visible across filter changes instead of
+        # collapsing it back down every time _apply_filter runs.
+        self._manually_expanded_companies: set[int] = set()
         # id(row) -> frozenset of that row's own project_name/full_title
         # words (see _row_words) — a row's text never changes once
         # loaded, but _company_matches_text/_row_fully_matches used to
@@ -1601,6 +1690,11 @@ class ProyectosInfoPage(QWidget):
         self.tree.setUpdatesEnabled(False)
         self.tree.clear()
         self._companies_with_revealed_rows.clear()
+        # Old company items (and their id()s) are gone after tree.clear()
+        # — clearing this too avoids a freshly-built, unrelated item
+        # coincidentally reusing a now-stale id() and starting out
+        # (wrongly) already treated as manually expanded.
+        self._manually_expanded_companies.clear()
         self._row_words_cache.clear()
 
         if self._error:
@@ -1624,13 +1718,15 @@ class ProyectosInfoPage(QWidget):
             # built by iterating self._rows in read order, and dicts
             # preserve insertion order).
             for company, company_rows in by_year[year].items():
-                # Column 0 (Estado) is intentionally blank here — a
-                # company can span several different statuses, so no
-                # single pill would be accurate; per-row status is shown
-                # on the company page instead. Column 1's text also
-                # doubles as what _apply_filter() matches against.
+                # Column 0 (Estado) and column 1 (Número de proyecto) are
+                # intentionally blank here — a company can span several
+                # different statuses AND several different project
+                # numbers, so no single value would be accurate for
+                # either; both are shown per-row on the company page
+                # instead. Column 2's text also doubles as what
+                # _apply_filter() matches against.
                 company_item = QTreeWidgetItem(
-                    year_item, ["", f"{company} ({len(company_rows)})", ""]
+                    year_item, ["", "", f"{company} ({len(company_rows)})", ""]
                 )
                 company_item.setData(0, Qt.UserRole, (year, company))
                 # The underlying rows themselves, stored on a different
@@ -1641,23 +1737,34 @@ class ProyectosInfoPage(QWidget):
                 company_item.setData(1, Qt.UserRole, company_rows)
 
                 for row in company_rows:
-                    row_item = QTreeWidgetItem(
-                        company_item, ["", row.get("project_name") or "", row.get("full_title") or ""]
-                    )
+                    row_item = QTreeWidgetItem(company_item, [
+                        "", row.get("project_number") or "",
+                        row.get("project_name") or "", row.get("full_title") or "",
+                    ])
                     row_item.setData(0, Qt.UserRole + 1, row["id"])
-                    row_item.setHidden(True)
-                    # Plain colored TEXT (see _set_status_text), NOT a
-                    # setItemWidget() pill — this loop can run for every
-                    # single project (thousands), and a real embedded
-                    # QLabel per row at that scale is what caused the
-                    # freeze-while-filtering reported after an earlier
-                    # version of this (see _set_status_text's docstring).
+                    # NOT row_item.setHidden(True) here — this item's
+                    # ancestor chain isn't attached to self.tree yet at
+                    # this point (that only happens below, via
+                    # addTopLevelItems), and QTreeWidgetItem.setHidden()
+                    # is a silent no-op when treeWidget() isn't set yet
+                    # (confirmed directly: isHidden() reads back False
+                    # either way). Harmless before this feature existed —
+                    # a collapsed company already hides its children from
+                    # view regardless of their own hidden flag — but now
+                    # that a company can be manually expanded/collapsed
+                    # (see _on_item_expanded/_on_item_collapsed), that
+                    # flag needs to actually be true from the start. Set
+                    # for real in the post-attachment loop below instead.
                     _set_status_text(row_item, 0, row.get("status"))
             year_items.append(year_item)
 
         self.tree.addTopLevelItems(year_items)
         for year_item in year_items:
             year_item.setExpanded(True)
+            for j in range(year_item.childCount()):
+                company_item = year_item.child(j)
+                for k in range(company_item.childCount()):
+                    company_item.child(k).setHidden(True)
             # setItemWidget needs the item already attached to the tree
             # (hence only done here, after addTopLevelItems above, not
             # while year_items was still being built off-tree) — but
@@ -1669,10 +1776,16 @@ class ProyectosInfoPage(QWidget):
             open_button.setObjectName("LinkButton")
             open_button.setCursor(Qt.PointingHandCursor)
             open_button.clicked.connect(lambda checked=False, y=year: self._open_year_excel(y))
-            self.tree.setItemWidget(year_item, 1, open_button)
+            # Column 2 ("Proyecto") — shifted from column 1 now that
+            # "Número de proyecto" sits between it and Estado; a year
+            # row has neither a single status nor a single project
+            # number, so column 1 stays blank here, same as for company
+            # rows above.
+            self.tree.setItemWidget(year_item, 2, open_button)
 
         self.tree.resizeColumnToContents(1)
         self.tree.resizeColumnToContents(2)
+        self.tree.resizeColumnToContents(3)
         self.tree.setUpdatesEnabled(True)
         self._apply_filter()
 
@@ -1772,8 +1885,12 @@ class ProyectosInfoPage(QWidget):
 
     def _row_matches_active_filters(self, row: dict) -> bool:
         """Whether this one row satisfies every ACTIVE filter at once —
-        the 4 fixed categories (Estado/Tipo/Subtipo1/Subtipo2), each an
-        exact-value match, PLUS the employee filter, matched the same
+        the 4 fixed categories (Estado/Tipo/Subtipo1/Subtipo2) PLUS the
+        employee filter. Estado/"status" is still an exact-value match
+        (single-choice); Tipo/Subtipo1/Subtipo2 are multi-choice now
+        (see CATEGORY_MULTI_FIELDS) — a row matches if the filter's
+        value is ANY ONE of that field's comma-separated selections, not
+        the cell's whole text. The employee filter is matched the same
         way "Lista de empleados" is read everywhere else (whole-word
         match_name lookup via _row_has_employee, not an exact string
         comparison — a row's employee_list is free text). A filter left
@@ -1781,7 +1898,12 @@ class ProyectosInfoPage(QWidget):
         blank"."""
         for key, combo in self._category_filters.items():
             selected = combo.currentText()
-            if selected != self._ALL_CATEGORY_LABEL and (row.get(key) or "") != selected:
+            if selected == self._ALL_CATEGORY_LABEL:
+                continue
+            if key in CATEGORY_MULTI_FIELDS:
+                if selected not in _category_values_from_text(row.get(key)):
+                    return False
+            elif (row.get(key) or "") != selected:
                 return False
         selected_employee = self.employee_filter.currentText()
         if selected_employee != self._ALL_CATEGORY_LABEL:
@@ -1874,6 +1996,12 @@ class ProyectosInfoPage(QWidget):
                 # child.child(k) are always the same row, same order, so
                 # no separate id lookup is needed here.
                 company_key = id(child)
+                # The user explicitly expanded this company via the
+                # tree's own arrow (see _on_item_expanded) — independent
+                # of any filter, so it stays expanded with every row
+                # visible below regardless of what this pass's filter
+                # matching finds, right up until they collapse it again.
+                manually_expanded = company_key in self._manually_expanded_companies
                 any_row_visible = False
                 if matches and (filter_words or any_category_active):
                     matched_count = 0
@@ -1889,12 +2017,20 @@ class ProyectosInfoPage(QWidget):
                     else:
                         self._companies_with_revealed_rows.discard(company_key)
                     if any_row_visible and matched_count < total:
-                        child.setText(1, f"{company} ({matched_count} de {total})")
+                        child.setText(2, f"{company} ({matched_count} de {total})")
                     else:
-                        child.setText(1, f"{company} ({total})")
+                        child.setText(2, f"{company} ({total})")
                 else:
                     if matches:
-                        child.setText(1, f"{company} ({len(company_rows)})")
+                        child.setText(2, f"{company} ({len(company_rows)})")
+                    if manually_expanded:
+                        # Show everything regardless of any earlier
+                        # filter-driven reveal — manual expand overrides
+                        # it, see the comment where manually_expanded is
+                        # computed above.
+                        for k in range(child.childCount()):
+                            child.child(k).setHidden(False)
+                        self._companies_with_revealed_rows.discard(company_key)
                     # Filter cleared, or this company no longer matches
                     # at all — make sure no previously-revealed row stays
                     # visible underneath it, but ONLY do that (bothering
@@ -1907,12 +2043,12 @@ class ProyectosInfoPage(QWidget):
                     # a filter cheap instead of re-touching all ~2,400
                     # row items on every single keystroke regardless of
                     # whether anything's actually visible.
-                    if company_key in self._companies_with_revealed_rows:
+                    elif company_key in self._companies_with_revealed_rows:
                         for k in range(child.childCount()):
                             child.child(k).setHidden(True)
                         self._companies_with_revealed_rows.discard(company_key)
 
-                child.setExpanded(any_row_visible)
+                child.setExpanded(any_row_visible or manually_expanded)
                 child.setHidden(not matches)
                 if matches:
                     year_visible_count += 1
@@ -1922,15 +2058,17 @@ class ProyectosInfoPage(QWidget):
         self.count_label.setText(
             self._error or f"{total_visible} empresa(s)"
         )
-        # Labels can grow longer than the original "(n)" (e.g. "(1 de
-        # 33)") — re-measure column 1 so that doesn't get clipped. Also
-        # column 2: at the last full _build_tree(), every visible item
-        # was a company row with a blank Título cell, so column 2 was
-        # sized to little more than its header — a now-revealed matching
-        # row can have a real, much longer Título that needs the column
-        # to grow to show it.
+        # Company labels can grow longer than the original "(n)" (e.g.
+        # "(1 de 33)") — re-measure column 2 (Proyecto) so that doesn't
+        # get clipped. Same reasoning for columns 1 and 3 (Número de
+        # proyecto/Título): at the last full _build_tree(), every
+        # visible item was a company row with those two cells blank, so
+        # both were sized to little more than their header — a
+        # now-revealed matching row can have a real, longer value in
+        # either that needs the column to grow to show it.
         self.tree.resizeColumnToContents(1)
         self.tree.resizeColumnToContents(2)
+        self.tree.resizeColumnToContents(3)
         self.tree.setUpdatesEnabled(True)
         self._refresh_filters_toggle_text()
 
@@ -1944,6 +2082,51 @@ class ProyectosInfoPage(QWidget):
             year, company = data
             self.company_opened.emit(year, company)
 
+    def _on_item_single_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
+        """One click anywhere on a company row (e.g. "CONSUM (16)") opens
+        it; one more click on it closes it again — same toggle
+        setExpanded() below always does, just triggered from a click
+        anywhere on the row instead of needing to hit the small arrow
+        specifically. Row items (leaves) and year items (always expanded,
+        see _build_tree) both do nothing here — only company items are
+        ever collapsible. Actually revealing/hiding the rows underneath
+        happens in _on_item_expanded/_on_item_collapsed, fired as a
+        result of this call changing the expanded state."""
+        company = item.data(0, Qt.UserRole)
+        if company is None:
+            return
+        item.setExpanded(not item.isExpanded())
+
+    def _on_item_expanded(self, item: QTreeWidgetItem) -> None:
+        """Fired when the user clicks a company's own expand arrow (year
+        items are already expanded from _build_tree, and row items have
+        no children of their own, so this only ever matters for company
+        items). Reveals every one of that company's rows — built once,
+        off-tree, in _build_tree, just hidden by default — so the user
+        can browse them right here in the list instead of having to
+        double-click through to ProyectosInfoCompanyPage. Tracked in
+        _manually_expanded_companies so a later _apply_filter() run
+        (typing in the search box, changing a filter dropdown) doesn't
+        collapse it back down or re-hide its rows — see that method."""
+        company = item.data(0, Qt.UserRole)
+        if company is None:
+            return  # a year item, not a company item
+        self._manually_expanded_companies.add(id(item))
+        for k in range(item.childCount()):
+            item.child(k).setHidden(False)
+
+    def _on_item_collapsed(self, item: QTreeWidgetItem) -> None:
+        """Inverse of _on_item_expanded — re-hides the rows and stops
+        tracking this company as manually expanded, so a future
+        _apply_filter() run treats it like any other collapsed company
+        again."""
+        company = item.data(0, Qt.UserRole)
+        if company is None:
+            return
+        self._manually_expanded_companies.discard(id(item))
+        for k in range(item.childCount()):
+            item.child(k).setHidden(True)
+
 
 class ProyectosInfoCompanyPage(QWidget):
     """Flat list of every project row for one company within one year —
@@ -1952,7 +2135,12 @@ class ProyectosInfoCompanyPage(QWidget):
     sync automatically, same pattern as ProyectosInfoDetailPage. Even a
     company with a single row lands here first (per the explicit
     request that singletons behave the same as multi-row companies);
-    double-clicking that one row still opens its own detail card."""
+    double-clicking that one row still opens its own detail card.
+
+    The "Eliminar" button in the top bar (see _on_delete_clicked) deletes
+    the single selected row for good — both from this list and from its
+    source cell in the year's xlsx (see writer.delete_project_info_row)
+    — after a confirm dialog, since it's not undoable."""
 
     project_info_opened = Signal(int)
 
@@ -1968,6 +2156,17 @@ class ProyectosInfoCompanyPage(QWidget):
         self.back_button.setCursor(Qt.PointingHandCursor)
         top_bar.addWidget(self.back_button, alignment=Qt.AlignLeft)
         top_bar.addStretch()
+        # Disabled until a row is actually selected (see
+        # _on_selection_changed) — deleting nothing shouldn't be
+        # clickable in the first place. Mirrors the "Eliminar" pattern
+        # from the employee roster cards (DangerButton, confirm dialog
+        # before anything is touched).
+        self.delete_button = QPushButton("🗑  Eliminar")
+        self.delete_button.setObjectName("DangerButton")
+        self.delete_button.setCursor(Qt.PointingHandCursor)
+        self.delete_button.setEnabled(False)
+        self.delete_button.clicked.connect(self._on_delete_clicked)
+        top_bar.addWidget(self.delete_button, alignment=Qt.AlignRight)
         outer.addLayout(top_bar)
 
         self.heading = QLabel("")
@@ -1980,13 +2179,25 @@ class ProyectosInfoCompanyPage(QWidget):
         outer.addWidget(self.count_label)
 
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(3)
-        self.tree.setHeaderLabels(["Estado", "Proyecto", "Título"])
+        self.tree.setColumnCount(4)
+        # Column reads "Carpeta" per explicit request — the underlying
+        # value is still project_number (NUMERO DE PROYECTO), unrelated
+        # to Buscar's own "Carpeta" column (an actual folder name); the
+        # field's own label elsewhere (the card, the Editar form, the
+        # label above the title on the detail page) is still "Número de
+        # proyecto" — only this table header changed.
+        self.tree.setHeaderLabels(["Estado", "Carpeta", "Proyecto", "Título"])
         self.tree.setAlternatingRowColors(True)
         self.tree.setRootIsDecorated(False)
         self.tree.header().setStretchLastSection(False)
         self.tree.setColumnWidth(0, 160)
+        # Single row at a time — matches the "select a row and delete
+        # that row" request, and keeps the confirm dialog able to name
+        # exactly one project rather than summarizing a batch.
+        self.tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.tree.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+        self.tree.itemSelectionChanged.connect(self._on_selection_changed)
         outer.addWidget(self.tree, 1)
 
         self._year: int | None = None
@@ -1995,6 +2206,10 @@ class ProyectosInfoCompanyPage(QWidget):
     def load(self, year: int, company: str) -> None:
         self._year, self._company = year, company
         self.heading.setText(f"{company} — {year}")
+        # Nothing is selected right after a (re)load — itemSelectionChanged
+        # doesn't reliably fire from clear() alone, so set this
+        # explicitly rather than relying on that.
+        self.delete_button.setEnabled(False)
 
         rows = [
             row for row in data_service.project_info_rows()
@@ -2008,7 +2223,10 @@ class ProyectosInfoCompanyPage(QWidget):
         # Original sheet order, same as everywhere else in this page —
         # not re-sorted.
         for row in rows:
-            item = QTreeWidgetItem(["", row["project_name"] or "", row.get("full_title") or ""])
+            item = QTreeWidgetItem([
+                "", row.get("project_number") or "",
+                row["project_name"] or "", row.get("full_title") or "",
+            ])
             item.setData(0, Qt.UserRole, row["id"])
             items.append((item, row.get("status")))
         self.tree.addTopLevelItems([item for item, _status in items])
@@ -2017,12 +2235,59 @@ class ProyectosInfoCompanyPage(QWidget):
 
         self.tree.resizeColumnToContents(1)
         self.tree.resizeColumnToContents(2)
+        self.tree.resizeColumnToContents(3)
         self.tree.setUpdatesEnabled(True)
 
     def _on_item_double_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
         item_id = item.data(0, Qt.UserRole)
         if item_id is not None:
             self.project_info_opened.emit(item_id)
+
+    def _on_selection_changed(self) -> None:
+        self.delete_button.setEnabled(bool(self.tree.selectedItems()))
+
+    def _on_delete_clicked(self) -> None:
+        selected = self.tree.selectedItems()
+        if not selected:
+            return
+        item = selected[0]
+        item_id = item.data(0, Qt.UserRole)
+        if item_id is None:
+            return
+        project_name = item.text(2) or "este proyecto"
+        answer = QMessageBox.question(
+            self,
+            "Eliminar proyecto",
+            f"¿Eliminar «{project_name}» de la lista?\n\n"
+            "Se borra la fila entera del archivo Excel — esto no se puede deshacer.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            data_service.delete_project_info(item_id)
+        except Exception as exc:
+            QMessageBox.critical(self, "No se pudo eliminar", str(exc))
+            return
+        self.load(self._year, self._company)
+
+
+class _CommentTextEdit(QTextEdit):
+    """A QTextEdit that emits focus_lost when it loses keyboard focus —
+    used to auto-save the "Comentario" box (see ProyectosInfoDetailPage
+    ._build_comment_panel) the moment you click away from it, same
+    "always interactive, saves without a separate Guardar step" idea as
+    the category radios/employee checklist elsewhere on that page, just
+    triggered by focus loss instead of a click/tick — saving on every
+    keystroke would hit the shared network file far too often for a
+    free-text box."""
+
+    focus_lost = Signal()
+
+    def focusOutEvent(self, event) -> None:
+        super().focusOutEvent(event)
+        self.focus_lost.emit()
 
 
 class ProyectosInfoDetailPage(QWidget):
@@ -2077,6 +2342,16 @@ class ProyectosInfoDetailPage(QWidget):
         top_bar.addWidget(self.edit_button)
         outer.addLayout(top_bar)
 
+        # NUMERO DE PROYECTO, shown above the project name itself — per
+        # explicit request — not just inside the fields card further
+        # down. Hidden entirely (not left blank) for a row that has no
+        # project number, same "don't show an empty field" convention as
+        # the rest of this page.
+        self.project_number_label = QLabel("")
+        self.project_number_label.setObjectName("MutedText")
+        self.project_number_label.setVisible(False)
+        outer.addWidget(self.project_number_label)
+
         self.title_label = QLabel("")
         self.title_label.setObjectName("PageTitle")
         self.title_label.setWordWrap(True)
@@ -2113,6 +2388,19 @@ class ProyectosInfoDetailPage(QWidget):
         self.card_layout.setColumnStretch(1, 1)
         content_layout.addWidget(self.card)
 
+        # Between the project-info card and the category pickers, per
+        # explicit request — reads/writes TRABAJOS A REALIZAR directly
+        # (see _on_comment_focus_out). PROJECT_INFO_FIELDS' own
+        # "Trabajos a realizar" line was removed to avoid showing this
+        # same value twice on the card; EDIT_TEXT_FIELDS' line in the
+        # batch Editar form was deliberately left in place (mutually
+        # exclusive with this box — Editar hides comment_panel while
+        # it's open — and it's what lets "Nuevo proyecto" set an
+        # initial value), so it's still reachable two ways with no
+        # risk of ever going stale, since both write the same cell.
+        self.comment_panel = self._build_comment_panel()
+        content_layout.addWidget(self.comment_panel)
+
         # Always part of the read view (shown/hidden together with
         # `card`, never gated behind "Editar") — each pick saves that one
         # field immediately, see _on_category_toggled.
@@ -2144,6 +2432,55 @@ class ProyectosInfoDetailPage(QWidget):
         self._item_id: int | None = None
         self._data: dict | None = None
 
+    def _build_comment_panel(self) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("Panel")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(22, 20, 22, 20)
+        layout.setSpacing(10)
+
+        title = QLabel("Comentario:")
+        title.setObjectName("MetricTitle")
+        layout.addWidget(title)
+
+        self.comment_box = _CommentTextEdit()
+        self.comment_box.setPlaceholderText("Escribe un comentario sobre este proyecto...")
+        self.comment_box.setFixedHeight(90)
+        self.comment_box.focus_lost.connect(self._on_comment_focus_out)
+        layout.addWidget(self.comment_box)
+
+        return panel
+
+    def _sync_comment_box(self, data: dict | None) -> None:
+        """Fills the comment box from TRABAJOS A REALIZAR (work_description)
+        without triggering a save — blockSignals also suppresses the
+        custom focus_lost signal (Qt blocks ALL signals from an object
+        while blockSignals(True) is set, not just the built-in ones),
+        same reasoning as _sync_category_radios/_sync_employee_checkboxes:
+        this reflects already-saved state, it isn't a user edit."""
+        self.comment_box.blockSignals(True)
+        self.comment_box.setPlainText((data or {}).get("work_description") or "")
+        self.comment_box.blockSignals(False)
+
+    def _on_comment_focus_out(self) -> None:
+        if self._item_id is None or self._data is None:
+            return
+        new_text = self.comment_box.toPlainText().strip()
+        current = (self._data.get("work_description") or "").strip()
+        if new_text == current:
+            return  # unchanged — no need to write anything
+        try:
+            data_service.update_project_info(self._item_id, {"work_description": new_text or None})
+        except Exception as exc:
+            QMessageBox.critical(self, "No se pudo guardar", str(exc))
+            self._sync_comment_box(self._data)  # revert to the last saved value
+            return
+        # Full reload — keeps PROJECT_INFO_FIELDS' own "Trabajos a
+        # realizar" line on the read-only card (if it's currently shown)
+        # in sync with what's now actually on disk, same as every other
+        # instant-save field on this page.
+        self.load(self._item_id)
+
     def _build_categories_panel(self) -> QFrame:
         panel = QFrame()
         panel.setObjectName("Panel")
@@ -2154,14 +2491,19 @@ class ProyectosInfoDetailPage(QWidget):
         layout.setColumnStretch(1, 1)
         row = 0
 
-        # value (a canonical option, or None for "sin especificar") ->
-        # its QRadioButton, one dict per category field — plus the
+        # PLANNING/"status" is single-choice: value (a canonical option,
+        # or None for "sin especificar") -> its QRadioButton, plus the
         # QButtonGroup itself, needed to block/unblock its signals while
         # load() sets the current selection programmatically (so that
         # doesn't get mistaken for the user clicking a new option and
         # trigger a write).
         self._category_radio_buttons: dict[str, dict[str | None, QRadioButton]] = {}
         self._category_groups: dict[str, QButtonGroup] = {}
+        # TIPO/SUBTIPO1/SUBTIPO2 are multi-choice instead (see
+        # CATEGORY_MULTI_FIELDS) — a plain checkbox per option, no
+        # "(sin especificar)" entry needed since leaving every box
+        # unticked already means that.
+        self._category_checkboxes: dict[str, dict[str, QCheckBox]] = {}
         for idx, (label_text, key) in enumerate(EDIT_CATEGORY_FIELDS):
             if idx > 0:
                 separator = QFrame()
@@ -2178,24 +2520,38 @@ class ProyectosInfoDetailPage(QWidget):
             options_layout = QVBoxLayout(options_widget)
             options_layout.setContentsMargins(0, 0, 0, 0)
             options_layout.setSpacing(4)
-            group = QButtonGroup(options_widget)
-            self._category_groups[key] = group
 
-            buttons: dict[str | None, QRadioButton] = {}
-            none_button = QRadioButton(_SIN_ESPECIFICAR)
-            group.addButton(none_button)
-            options_layout.addWidget(none_button)
-            buttons[None] = none_button
-            for option in CATEGORY_OPTIONS[key]:
-                button = QRadioButton(option)
-                group.addButton(button)
-                options_layout.addWidget(button)
-                buttons[option] = button
-            self._category_radio_buttons[key] = buttons
+            if key in CATEGORY_MULTI_FIELDS:
+                checkboxes: dict[str, QCheckBox] = {}
+                for option in CATEGORY_OPTIONS[key]:
+                    checkbox = QCheckBox(option)
+                    checkbox.setCursor(Qt.PointingHandCursor)
+                    options_layout.addWidget(checkbox)
+                    checkboxes[option] = checkbox
+                self._category_checkboxes[key] = checkboxes
+                for checkbox in checkboxes.values():
+                    checkbox.toggled.connect(
+                        lambda checked, key=key: self._on_category_checkbox_toggled(key)
+                    )
+            else:
+                group = QButtonGroup(options_widget)
+                self._category_groups[key] = group
 
-            group.buttonToggled.connect(
-                lambda button, checked, key=key: self._on_category_toggled(key, button, checked)
-            )
+                buttons: dict[str | None, QRadioButton] = {}
+                none_button = QRadioButton(_SIN_ESPECIFICAR)
+                group.addButton(none_button)
+                options_layout.addWidget(none_button)
+                buttons[None] = none_button
+                for option in CATEGORY_OPTIONS[key]:
+                    button = QRadioButton(option)
+                    group.addButton(button)
+                    options_layout.addWidget(button)
+                    buttons[option] = button
+                self._category_radio_buttons[key] = buttons
+
+                group.buttonToggled.connect(
+                    lambda button, checked, key=key: self._on_category_toggled(key, button, checked)
+                )
 
             layout.addWidget(label, row, 0)
             layout.addWidget(options_widget, row, 1)
@@ -2204,17 +2560,30 @@ class ProyectosInfoDetailPage(QWidget):
         return panel
 
     def _sync_category_radios(self, data: dict | None) -> None:
-        """Select the radio matching each category field's current value
-        — WITHOUT triggering _on_category_toggled (signals blocked),
-        since this just reflects already-saved state, it isn't a user
-        edit to write back."""
+        """Reflect each category field's current saved value — WITHOUT
+        triggering a save (signals blocked), since this just reflects
+        already-saved state, it isn't a user edit to write back.
+        Single-choice PLANNING selects the matching radio (falling back
+        to "(sin especificar)" for a blank or now-unrecognized value);
+        multi-choice TIPO/SUBTIPO1/SUBTIPO2 tick every checkbox whose
+        option appears in that field's comma-separated cell text (see
+        _category_values_from_text) — a legacy off-list token is simply
+        left unrepresented by any checkbox, same lenient fallback as the
+        radios."""
         for _label, key in EDIT_CATEGORY_FIELDS:
             current = data.get(key) if data else None
-            buttons = self._category_radio_buttons[key]
-            group = self._category_groups[key]
-            group.blockSignals(True)
-            buttons.get(current, buttons[None]).setChecked(True)
-            group.blockSignals(False)
+            if key in CATEGORY_MULTI_FIELDS:
+                selected = _category_values_from_text(current)
+                for option, checkbox in self._category_checkboxes[key].items():
+                    checkbox.blockSignals(True)
+                    checkbox.setChecked(option in selected)
+                    checkbox.blockSignals(False)
+            else:
+                buttons = self._category_radio_buttons[key]
+                group = self._category_groups[key]
+                group.blockSignals(True)
+                buttons.get(current, buttons[None]).setChecked(True)
+                group.blockSignals(False)
 
     def _on_category_toggled(self, key: str, button: QRadioButton, checked: bool) -> None:
         # QButtonGroup fires buttonToggled twice per click — once for the
@@ -2241,6 +2610,23 @@ class ProyectosInfoDetailPage(QWidget):
         # Full reload — cheap at this dataset's size, and guarantees the
         # status pill, the card's derived fields, and every other
         # category radio stay in sync with what's now actually on disk.
+        self.load(self._item_id)
+
+    def _on_category_checkbox_toggled(self, key: str) -> None:
+        """Multi-choice counterpart of _on_category_toggled, for TIPO/
+        SUBTIPO1/SUBTIPO2 (see CATEGORY_MULTI_FIELDS). Recomputed from
+        ALL currently ticked boxes for this field (not just the one that
+        just changed) — same approach as _on_employee_toggled — so the
+        saved cell is always exactly "whatever's ticked right now"."""
+        if self._item_id is None:
+            return
+        value = _joined_text_from_checkboxes(self._category_checkboxes[key])
+        try:
+            data_service.update_project_info(self._item_id, {key: value})
+        except Exception as exc:
+            QMessageBox.critical(self, "No se pudo guardar", str(exc))
+            self._sync_category_radios(self._data)  # revert to the last saved values
+            return
         self.load(self._item_id)
 
     def _build_employees_panel(self) -> QFrame:
@@ -2303,10 +2689,10 @@ class ProyectosInfoDetailPage(QWidget):
             return
         # Recomputed from ALL currently ticked boxes (not just this one
         # name added/removed from the old text) — the same approach
-        # _employee_list_text_from_checkboxes always uses, so the saved
-        # cell is always exactly "whoever's ticked right now", never
-        # drifting from what's shown on screen.
-        new_text = _employee_list_text_from_checkboxes(self._employee_checkboxes)
+        # _joined_text_from_checkboxes always uses, so the saved cell is
+        # always exactly "whoever's ticked right now", never drifting
+        # from what's shown on screen.
+        new_text = _joined_text_from_checkboxes(self._employee_checkboxes)
         try:
             data_service.update_project_info(self._item_id, {"employee_list": new_text})
         except Exception as exc:
@@ -2403,6 +2789,11 @@ class ProyectosInfoDetailPage(QWidget):
             return
         self._data = data
 
+        project_number = data.get("project_number")
+        self.project_number_label.setVisible(bool(project_number))
+        if project_number:
+            self.project_number_label.setText(f"Número de proyecto: {project_number}")
+
         self.title_label.setText(data.get("project_name") or "(Sin nombre)")
 
         status = data.get("status")
@@ -2423,9 +2814,11 @@ class ProyectosInfoDetailPage(QWidget):
         # for THIS row against those freshly-built checkboxes.
         self._rebuild_employee_checklist()
         self._sync_employee_checkboxes(data)
+        self._sync_comment_box(data)
 
         self._clear_card()
         self.card.setVisible(True)
+        self.comment_panel.setVisible(True)
         self.categories_panel.setVisible(True)
         self.employees_panel.setVisible(True)
         row_idx = 0
@@ -2482,6 +2875,7 @@ class ProyectosInfoDetailPage(QWidget):
         # OTHER unsaved edits in progress here, to avoid any confusion
         # about what's saved and what isn't.
         self.card.setVisible(False)
+        self.comment_panel.setVisible(False)
         self.categories_panel.setVisible(False)
         self.employees_panel.setVisible(False)
         self.status_pill.setVisible(False)
@@ -2623,7 +3017,14 @@ class ProyectosInfoNewPage(QWidget):
         self._rebuild_new_employee_checklist()
         row += 1
 
+        # PLANNING/"status" is single-choice (radios); TIPO/SUBTIPO1/
+        # SUBTIPO2 are multi-choice (checkboxes, see CATEGORY_MULTI_
+        # FIELDS) — same split as ProyectosInfoDetailPage's
+        # categories_panel. Nothing here auto-saves (this whole form is
+        # only read once, at _on_create_clicked), so no signal wiring is
+        # needed either way, just somewhere to read the final picks from.
         self._new_radio_buttons: dict[str, dict[str | None, QRadioButton]] = {}
+        self._new_category_checkboxes: dict[str, dict[str, QCheckBox]] = {}
         for idx, (label_text, key) in enumerate(EDIT_CATEGORY_FIELDS):
             cat_separator = QFrame()
             cat_separator.setObjectName("DottedSeparator")
@@ -2639,22 +3040,32 @@ class ProyectosInfoNewPage(QWidget):
             options_layout = QVBoxLayout(options_widget)
             options_layout.setContentsMargins(0, 0, 0, 0)
             options_layout.setSpacing(4)
-            group = QButtonGroup(options_widget)
 
-            buttons: dict[str | None, QRadioButton] = {}
-            none_button = QRadioButton(_SIN_ESPECIFICAR)
-            group.addButton(none_button)
-            options_layout.addWidget(none_button)
-            buttons[None] = none_button
-            for option in CATEGORY_OPTIONS[key]:
-                button = QRadioButton(option)
-                group.addButton(button)
-                options_layout.addWidget(button)
-                buttons[option] = button
+            if key in CATEGORY_MULTI_FIELDS:
+                checkboxes: dict[str, QCheckBox] = {}
+                for option in CATEGORY_OPTIONS[key]:
+                    checkbox = QCheckBox(option)
+                    checkbox.setCursor(Qt.PointingHandCursor)
+                    options_layout.addWidget(checkbox)
+                    checkboxes[option] = checkbox
+                self._new_category_checkboxes[key] = checkboxes
+            else:
+                group = QButtonGroup(options_widget)
+
+                buttons: dict[str | None, QRadioButton] = {}
+                none_button = QRadioButton(_SIN_ESPECIFICAR)
+                group.addButton(none_button)
+                options_layout.addWidget(none_button)
+                buttons[None] = none_button
+                for option in CATEGORY_OPTIONS[key]:
+                    button = QRadioButton(option)
+                    group.addButton(button)
+                    options_layout.addWidget(button)
+                    buttons[option] = button
+                self._new_radio_buttons[key] = buttons
 
             layout.addWidget(label, row, 0)
             layout.addWidget(options_widget, row, 1)
-            self._new_radio_buttons[key] = buttons
             row += 1
 
         button_row = QHBoxLayout()
@@ -2706,6 +3117,9 @@ class ProyectosInfoNewPage(QWidget):
         self._rebuild_new_employee_checklist()
         for buttons in self._new_radio_buttons.values():
             buttons[None].setChecked(True)
+        for checkboxes in self._new_category_checkboxes.values():
+            for checkbox in checkboxes.values():
+                checkbox.setChecked(False)
         self._new_inputs["project_name"].setFocus()
 
     def _on_create_clicked(self) -> None:
@@ -2719,10 +3133,13 @@ class ProyectosInfoNewPage(QWidget):
             values[key] = self._new_inputs[key].text().strip() or None
         for _label, key in EDIT_MULTILINE_FIELDS:
             values[key] = self._new_multiline[key].toPlainText().strip() or None
-        values["employee_list"] = _employee_list_text_from_checkboxes(
+        values["employee_list"] = _joined_text_from_checkboxes(
             self._new_employee_checkboxes
         )
         for _label, key in EDIT_CATEGORY_FIELDS:
+            if key in CATEGORY_MULTI_FIELDS:
+                values[key] = _joined_text_from_checkboxes(self._new_category_checkboxes[key])
+                continue
             selected = None
             for value, button in self._new_radio_buttons[key].items():
                 if button.isChecked():
@@ -3745,6 +4162,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Sincronización completada{year_suffix}: {len(added)} fila(s) nueva(s)", 6000
         )
+        flagged = result.get("flagged") or []
+        flagged_suffix = f"Proyectos con subproyectos: {len(flagged)}\n" if flagged else ""
         if added:
             lines = "\n".join(f"  • {row['nombre']}  ({row['numero_de_proyecto']})" for row in added)
             QMessageBox.information(
@@ -3753,6 +4172,7 @@ class MainWindow(QMainWindow):
                 f"Año: {year}\n"
                 f"Carpetas revisadas: {result.get('checked')}\n"
                 f"Ya existían: {result.get('already_present')}\n"
+                f"{flagged_suffix}"
                 f"Filas nuevas añadidas ({len(added)}):\n{lines}",
             )
             self.proyectos_info_page.refresh()
@@ -3762,6 +4182,7 @@ class MainWindow(QMainWindow):
                 "Sincronización completada",
                 f"Año: {year}\n"
                 f"Carpetas revisadas: {result.get('checked')}\n"
+                f"{flagged_suffix}"
                 "No se encontró ninguna carpeta nueva — el Excel ya estaba al día.",
             )
 

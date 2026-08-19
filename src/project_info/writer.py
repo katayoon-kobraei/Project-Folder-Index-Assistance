@@ -165,6 +165,27 @@ def update_project_info_row(dir_path: str, year: int, row_number: int, updates: 
         wb.close()
 
 
+def delete_project_info_row(dir_path: str, year: int, row_number: int) -> None:
+    """Permanently remove row `row_number` from `{dir_path}/{year}.xlsx`
+    — a real ws.delete_rows(), not just clearing the cells, so a
+    deleted project actually disappears from the sheet instead of
+    leaving a blank row behind forever. Every row below it shifts up by
+    one as a result; that's fine because row_number is never cached
+    across a write — load_project_info() recomputes it fresh from the
+    sheet's current layout on every call (see reader.py), and every
+    caller here re-reads via project_info_rows()/project_info_detail()
+    right before it ever needs a row_number again.
+
+    Raises FileNotFoundError if the year file doesn't exist."""
+    file_path, wb = _open_year_file(dir_path, year)
+    try:
+        ws = wb.worksheets[0]
+        ws.delete_rows(row_number, 1)
+        wb.save(str(file_path))
+    finally:
+        wb.close()
+
+
 def append_project_info_row(dir_path: str, year: int, values: dict) -> int:
     """Add a brand-new row at the end of `{dir_path}/{year}.xlsx`,
     writing `values` (same field-key -> value shape as

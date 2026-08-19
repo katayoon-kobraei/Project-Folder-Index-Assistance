@@ -1,0 +1,67 @@
+# Copy this file to config.yaml and adjust. config.yaml is gitignored.
+
+# Each entry is an independent archive tree to crawl. They can have
+# completely different folder-naming conventions.
+roots:
+  - name: trabajos
+    root_path: "P:\\"
+    # Only top-level folders matching this are treated as project years.
+    year_folder_pattern: "^TRABAJOS (\\d{4})$"
+    # job codes look like "YY-NNN NAME", sites like "YY-NNN-SS NAME"
+    code_kind: job
+
+  - name: ofertas
+    root_path: "P:\\OFERTAS Y CONCURSOS"
+    # Year folders here are named just "2025", "2026", etc.
+    year_folder_pattern: "^(\\d{4})$"
+    # offer codes look like "NNN.- NAME", no year/site level
+    code_kind: offer
+
+# Names to skip entirely, anywhere in the tree (sync/recycle artifacts etc.)
+ignore_names:
+  - "#recycle"
+  - "_gsdata_"
+  - "Thumbs.db"
+  - ".DS_Store"
+
+db_path: "data/index.db"
+
+# Skip re-listing files inside a folder whose modified date hasn't changed
+# since the last crawl — the expensive part on a network drive is the
+# per-file check, not walking the folder tree itself. Set to false (or
+# run `python scripts/run_crawl.py --full`) for a guaranteed full rescan.
+incremental: true
+
+# --- Optional: ONE shared index for every PC, instead of each PC keeping ---
+# --- its own local copy (the default when both keys below are left unset) --
+#
+# Leave shared_db_path unset (the default) and every PC crawls P:\ itself
+# and keeps its own local index.db at db_path above — the safest option,
+# and what the installer sets up unless you explicitly opt into this.
+#
+# Set shared_db_path to a path on the server (e.g. under P:\) to have every
+# installed PC query THAT one file instead of its own local db_path. Only
+# ONE PC total should also have is_index_builder set to true — that PC's
+# own "Actualizar" is the only one that's allowed to actually crawl; every
+# other PC just reads the shared file (read-only, never writes or creates
+# it). This exists because SQLite's own file-locking is not reliable for
+# multiple PCs writing to the same file over a Windows network share —
+# only ever having ONE writer avoids that entirely. The builder PC still
+# crawls into its own LOCAL db_path first (same as always), then publishes
+# a finished copy to shared_db_path once the crawl succeeds — readers never
+# see a half-written file, only the previous complete one or the new
+# complete one.
+#
+# shared_db_path: "P:\\project_info\\index.db"
+# is_index_builder: false
+
+# Folder containing 2008.xlsx through 2026.xlsx — the desktop app's
+# "Proyectos Info" page reads AND WRITES these directly (ticking an
+# employee, editing a field, or creating a project saves straight into
+# the matching row/cells here). This must be the SAME shared network
+# folder on every installed PC (e.g. a path under P:\), not a local
+# copy, so every PC's edits land in the same files and everyone sees
+# the same data. db_path above is the opposite: that one stays LOCAL
+# per PC (each machine keeps its own copy of the crawled index and
+# rebuilds it from P:\ itself via the "Actualizar" button).
+project_info_dir: "P:\\project_info"
